@@ -1,0 +1,11 @@
+# 外星花园交互展示程序 —— 运行依赖
+# 安装命令：python -m pip install -r requirements.txt
+#
+# PyQt5：全屏展示窗口、多媒体视频播放
+PyQt5>=5.15.9,<5.16
+# OpenCV：摄像头采集、图像处理
+opencv-python>=4.8,<5
+# NumPy：OpenCV 图像矩阵运算
+numpy>=1.24,<3
+# pyzbar：二维码识别（Windows 安装包内已包含 libzbar DLL）
+pyzbar>=0.1.9
