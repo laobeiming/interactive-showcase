@@ -218,3 +218,23 @@ class LinkageTests(unittest.TestCase):
         self.assertFalse(scene_image.isNull())
         self.assertGreater(scene_image.width(), 0)
 
+
+
+class EntryPointTests(unittest.TestCase):
+    """main.py 统一入口的默认参数测试。"""
+
+    def test_camera_and_fullscreen_are_default(self) -> None:
+        args = showcase_main.parse_args([])
+        self.assertFalse(args.no_camera)
+        self.assertFalse(args.windowed)
+
+    def test_no_camera_flag_disables_scanner(self) -> None:
+        args = showcase_main.parse_args(["--no-camera", "--windowed"])
+        self.assertTrue(args.no_camera)
+        self.assertTrue(args.windowed)
+
+    def test_start_camera_flag_remains_compatible(self) -> None:
+        args = showcase_main.parse_args(["--start-camera"])
+        self.assertTrue(args.start_camera)
+        self.assertFalse(args.no_camera)
+

@@ -1,12 +1,18 @@
-"""外星花园交互展示程序 —— 阶段二：视觉检测与画面联动。
+"""外星花园交互展示程序 —— 唯一完整入口（全屏展示 + 摄像头识别联动）。
 
 用法：
-    python main.py                              # 待机展示（自动查找待机视频）
+    python main.py                              # 全屏运行，启动即打开摄像头扫描
     python main.py --windowed                   # 1280x720 窗口调试
-    python main.py --windowed --no-video --start-camera
-                                                # 直接用笔记本摄像头测试
-    python main.py --windowed --no-video --start-camera --camera 0
-    python main.py --no-video --start-camera --tilt-threshold 8
+    python main.py --no-camera                  # 仅播放待机页，不打开摄像头
+    python main.py --camera 0 --width 1920 --height 1080
+    python main.py --windowed --no-video        # 无视频时使用呼吸文字待机页
+    python main.py --no-camera --selftest       # 终端自检（不依赖摄像头）
+
+默认行为：
+    * 全屏无边框显示；
+    * 自动扫描 assets/videos 下的待机视频；
+    * 启动后台 VisionWorker，调用 scanner.CameraScanner 检测摄像头画面中的
+      二维码与图纸倾斜角，满足条件后自动联动大屏。
 
 快捷键：
     C    打开 / 关闭摄像头实时扫描（联动后按 C 返回扫描页）
@@ -1603,7 +1609,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--start-camera",
         action="store_true",
-        help="启动后立即打开摄像头进入实时扫描",
+        help="兼容旧版本参数；摄像头现已默认开启",
     )
     parser.add_argument(
         "--no-camera",
@@ -1672,7 +1678,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LOGGER.warning("视觉模块不可用：%s", SCANNER_IMPORT_ERROR)
     elif args.no_camera:
         LOGGER.info("摄像头已通过 --no-camera 禁用")
-    elif args.start_camera:
+    else:
         LOGGER.info("启动后立即进入摄像头扫描（index=%s）", args.camera)
 
     window = StandbyWindow(
@@ -1683,7 +1689,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         camera_index=args.camera,
         camera_width=args.width,
         camera_height=args.height,
-        start_camera=args.start_camera and not args.no_camera,
+        start_camera=not args.no_camera,
         camera_enabled=not args.no_camera,
         tilt_threshold=args.tilt_threshold,
         min_paper_ratio=args.min_paper_ratio,
@@ -1702,7 +1708,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         summary = window.selftest_summary()
         print("SELFTEST_SUMMARY " + json.dumps(summary, ensure_ascii=False))
         ok = True
-        if args.start_camera and not args.no_camera:
+        if not args.no_camera:
             ok = summary["frames"] > 0 and not summary["camera_error"]
         print("SELFTEST_OK" if ok else "SELFTEST_FAIL")
         return 0 if ok else 1

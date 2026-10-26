@@ -8,7 +8,7 @@
 - **核心语言**：Python 3.10+
 - **计算机视觉**：OpenCV (图像边缘计算、角度矫正、高拍仪推流)
 - **解码组件**：PyZbar (二维码秒级解码匹配)
-- **界面交互**：PyQt5 / PySide6 (多媒体全屏展示、无缝视频切换)
+- **界面交互**：PyQt5 (多媒体全屏展示、无缝视频切换)
 - **硬件集成**：USB 外部触发按键监听、Windows 开机自启服务
 
 ---
@@ -28,9 +28,11 @@
 ### 当前文件结构
 ```
 interactive-showcase/
-├── main.py                 # 全屏无边框待机展示窗口（视频循环 + 呼吸文字兜底）
-├── scanner.py              # 摄像头采集与二维码识别模块（可独立预览）
+├── main.py                 # 唯一完整入口：全屏展示 + 摄像头扫描 + 场景联动
+├── scanner.py              # 摄像头采集、二维码识别与图纸姿态模块（可独立调试）
+├── run.bat                 # Windows 双击启动（自动检查 / 安装依赖）
 ├── requirements.txt        # Python 运行依赖
+├── tests/                  # 自动化单元测试
 ├── assets/videos/          # 待机背景视频放置目录
 └── captures/               # 现场调试快照与识别标注图（运行时自动生成）
 ```
@@ -40,14 +42,16 @@ interactive-showcase/
 cd "d:\多媒体沉浸式交互控制系统\interactive-showcase"
 python -m pip install -r requirements.txt
 ```
+- 也可直接双击 `run.bat`：脚本会自动定位 Python / `.venv`、检查并安装缺失依赖，然后全屏启动 `main.py`。
 
 ### 2. 启动待机展示
 ```powershell
-python main.py                 # 全屏无边框运行
+python main.py                 # 全屏运行，启动即打开摄像头实时扫描
 python main.py --windowed      # 1280x720 窗口运行，便于调试
+python main.py --no-camera     # 只播放待机页，不打开摄像头
 python main.py --no-video      # 强制使用黑色呼吸文字待机页
 ```
-- 按 **ESC** 退出程序，按 **F11** 切换全屏 / 窗口。
+- 按 **ESC** 退出程序，按 **C** 打开 / 关闭摄像头扫描，按 **F11** 切换全屏 / 窗口。
 - 将待机视频放入 `assets/videos/`（推荐命名 `standby.mp4`，H.264 编码），程序会自动循环播放。
 - 未找到视频或视频解码失败时，自动切换到 **纯黑背景 + 呼吸文字** 待机页，展厅不会黑屏。
 
@@ -63,10 +67,10 @@ python scanner.py --image path/to/qr.png # 离线识别单张图片
 
 ### 4. 没有摄像头 / 展台设备时如何演示
 ```powershell
-python main.py --windowed                   # 查看待机呼吸页
+python main.py --windowed --no-camera       # 查看待机呼吸页
 python scanner.py --demo                    # 模拟摄像头：动态画纸 + 二维码实时识别
 python scanner.py --image demo/qr_demo.png  # 离线识别演示图片
-python main.py --windowed --video demo/standby_demo.avi  # 查看待机视频循环效果
+python main.py --windowed --video demo/standby_demo.avi --no-camera  # 待机视频循环
 ```
 - `--demo` 会生成“桌面上的手绘画纸 + 二维码”动态画面，**无需真实摄像头**；按 `q / ESC` 退出，按 `s` 截图。
 - `demo/` 目录用于本地演示素材，已加入 `.gitignore`，不会推送到仓库。
@@ -90,23 +94,27 @@ python main.py --windowed --video demo/standby_demo.avi  # 查看待机视频循
 
 ### 2. 启动联动
 ```powershell
-python main.py --windowed --start-camera                # 窗口调试 + 摄像头扫描
-python main.py --start-camera                           # 全屏运行
-python main.py --start-camera --tilt-threshold 8 --min-paper-ratio 0.04
-python main.py --start-camera --camera 1 --width 1920 --height 1080
+python main.py                 # 全屏运行 + 摄像头扫描（默认行为）
+python main.py --windowed      # 窗口调试 + 摄像头扫描
+python main.py --no-camera     # 禁用摄像头，仅待机展示
+python main.py --tilt-threshold 8 --min-paper-ratio 0.04
+python main.py --camera 1 --width 1920 --height 1080
 ```
-- 扫描页按 **C** 打开摄像头 / 返回待机；联动页按 **C** 立即返回扫描页。
+- 扫描页按 **C** 关闭摄像头 / 返回待机；联动页按 **C** 立即返回扫描页。
+- `--start-camera` 仍可传入，但摄像头现已默认开启，仅为兼容旧脚本保留。
 
-**Windows 一键启动（推荐日常调试）**
-- 双击 `start_camera.bat`：直接打开摄像头 + 二维码识别预览（`q / ESC` 退出，`s` 保存快照）。
-- 双击 `start_show.bat`：阶段二完整联动（窗口模式，`C` 切换扫描/待机，`ESC` 退出）。
-- 指定摄像头编号时，在命令行执行 `start_camera.bat 1`（不传参数默认 0 号摄像头）。
+**Windows 一键启动（推荐日常使用）**
+- 双击 `run.bat`：自动定位 Python、检查依赖，随后全屏运行 `main.py` 并打开摄像头扫描。
+- 首次运行若缺少依赖，`run.bat` 会自动执行 `pip install -r requirements.txt`。
+- 需要窗口调试时，可在命令行执行 `run.bat --windowed`；只演示待机页可执行 `run.bat --no-camera`。
+- 若项目内存在 `.venv`，`run.bat` 会优先使用 `.venv\Scripts\python.exe`。
 
 - 二维码内置主题关键字：`GARDEN / ALIEN`（外星花园）、`OCEAN / SEA / AQUA`（深海星潮）、`FOREST / TREE`（荧光森林）、`DESERT / SAND`（赤砂星球）；未知 ID 使用稳定兜底主题。
 
 ### 3. 终端自检与测试（无需界面）
 ```powershell
 python scanner.py --selftest                            # 合成图纸：角度 + 二维码 + 联动状态
+python main.py --no-camera --selftest --selftest-seconds 3   # 主程序无摄像头自检
 python test_vision.py --demo --no-window --frames 30    # 无摄像头端到端联调
 python test_vision.py --no-window --frames 60           # 真实摄像头逐帧联调
 python -m unittest discover -s tests -v                 # 单元测试
