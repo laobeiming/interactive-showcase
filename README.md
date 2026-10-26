@@ -61,7 +61,18 @@ python scanner.py --image path/to/qr.png # 离线识别单张图片
 - 预览窗口按 **q / ESC** 退出，按 **s** 保存快照到 `captures/`。
 - 识别结果包含二维码内容、外接矩形与中心点，可直接供后续场景联动使用。
 
-### 4. 说明
+### 4. 没有摄像头 / 展台设备时如何演示
+```powershell
+python main.py --windowed                   # 查看待机呼吸页
+python scanner.py --demo                    # 模拟摄像头：动态画纸 + 二维码实时识别
+python scanner.py --image demo/qr_demo.png  # 离线识别演示图片
+python main.py --windowed --video demo/standby_demo.avi  # 查看待机视频循环效果
+```
+- `--demo` 会生成“桌面上的手绘画纸 + 二维码”动态画面，**无需真实摄像头**；按 `q / ESC` 退出，按 `s` 截图。
+- `demo/` 目录用于本地演示素材，已加入 `.gitignore`，不会推送到仓库。
+- 当前阶段尚未接入实体按键与纸张姿态检测，硬件到货后可继续联调。
+
+### 5. 说明
 - 二维码识别依赖 `pyzbar`；Windows 安装包内已带 `libzbar` DLL，若提示加载失败，请安装 Microsoft Visual C++ 运行库。
 - 待机视频默认静音，可用 `python main.py --volume 50` 调整。
 - 现场调试快照目录 `captures/` 已加入 `.gitignore`，不会误提交。

@@ -13,6 +13,7 @@
     python scanner.py --camera 1          # 指定第二路摄像头
     python scanner.py --image qr.png      # 离线识别单张图片
     python scanner.py --list-cameras      # 探测可用摄像头
+    python scanner.py --demo              # 无摄像头演示（模拟画纸 + 二维码）
 
 预览窗口按键：q / ESC 退出，s 保存当前帧快照。
 """
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import platform
 import time
 from dataclasses import dataclass
@@ -328,6 +330,234 @@ def annotate_frame(
     return canvas
 
 
+def _render_demo_qr(text: str, size: int) -> np.ndarray:
+    """生成带白色静区的二维码图片，用于无摄像头演示。"""
+    encoder = cv2.QRCodeEncoder_create()
+    modules = encoder.encode(text)
+    qr_image = cv2.resize(modules, (size, size), interpolation=cv2.INTER_NEAREST)
+    if qr_image.ndim == 2:
+        qr_image = cv2.cvtColor(qr_image, cv2.COLOR_GRAY2BGR)
+    border = max(10, size // 12)
+    return cv2.copyMakeBorder(
+        qr_image,
+        border,
+        border,
+        border,
+        border,
+        cv2.BORDER_CONSTANT,
+        value=255,
+    )
+
+
+def build_demo_frame(
+    width: int = 1280,
+    height: int = 720,
+    elapsed: float = 0.0,
+    qr_text: str = "ALIEN-GARDEN-DEMO-001",
+) -> np.ndarray:
+    """生成一帧“桌面上的儿童画纸”模拟画面，无需真实摄像头。
+
+    画面包含：深色桌面、手绘外星人、二维码、扫描框和轻微摆动，
+    可直接交给 ``CameraScanner.scan_frame()`` 做识别演示。
+    """
+    width = max(960, int(width))
+    height = max(540, int(height))
+
+    # 深色桌面渐变 + 轻微噪点
+    ramp = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None, None]
+    top = np.array([30.0, 27.0, 24.0], dtype=np.float32)
+    bottom = np.array([8.0, 10.0, 10.0], dtype=np.float32)
+    frame = np.broadcast_to(
+        top * (1.0 - ramp) + bottom * ramp,
+        (height, width, 3),
+    ).copy()
+    noise = np.random.default_rng(7).normal(0.0, 1.6, (height, width, 1))
+    frame = np.clip(frame + noise.astype(np.float32), 0, 255).astype(np.uint8)
+
+    # 画纸
+    paper_height = int(min(height * 0.84, width * 0.72))
+    paper_width = int(paper_height / 1.42)
+    paper = np.full((paper_height, paper_width, 3), (238, 241, 235), dtype=np.uint8)
+    for y in range(36, paper_height, 30):
+        cv2.line(paper, (0, y), (paper_width, y), (229, 233, 226), 1)
+    margin_x = int(paper_width * 0.06)
+    cv2.line(paper, (margin_x, 0), (margin_x, paper_height), (214, 224, 230), 2)
+    cv2.rectangle(
+        paper,
+        (2, 2),
+        (paper_width - 3, paper_height - 3),
+        (205, 210, 202),
+        2,
+    )
+
+    # 手绘外星人
+    head_center = (int(paper_width * 0.34), int(paper_height * 0.27))
+    head_axes = (int(paper_width * 0.15), int(paper_height * 0.09))
+    cv2.ellipse(paper, head_center, head_axes, 0, 0, 360, (66, 158, 92), 3, cv2.LINE_AA)
+    eye_offset_x = head_axes[0] // 2
+    eye_y = head_center[1] - head_axes[1] // 4
+    for sign in (-1, 1):
+        eye = (head_center[0] + sign * eye_offset_x, eye_y)
+        cv2.circle(paper, eye, max(4, paper_width // 70), (38, 45, 45), -1, cv2.LINE_AA)
+    for sign in (-1, 1):
+        start = (
+            head_center[0] + sign * head_axes[0] // 2,
+            head_center[1] - head_axes[1] + 6,
+        )
+        end = (
+            start[0] + sign * int(paper_width * 0.05),
+            start[1] - int(paper_height * 0.06),
+        )
+        cv2.line(paper, start, end, (66, 158, 92), 2, cv2.LINE_AA)
+        cv2.circle(paper, end, max(5, paper_width // 65), (60, 200, 245), -1, cv2.LINE_AA)
+
+    body_center = (head_center[0], int(paper_height * 0.52))
+    body_axes = (int(paper_width * 0.12), int(paper_height * 0.14))
+    cv2.ellipse(paper, body_center, body_axes, 0, 0, 360, (86, 178, 112), 3, cv2.LINE_AA)
+    arm_y = body_center[1] - int(paper_height * 0.03)
+    cv2.line(
+        paper,
+        (body_center[0] - body_axes[0], arm_y),
+        (body_center[0] - body_axes[0] - int(paper_width * 0.12), arm_y - int(paper_height * 0.05)),
+        (86, 178, 112),
+        3,
+        cv2.LINE_AA,
+    )
+    cv2.line(
+        paper,
+        (body_center[0] + body_axes[0], arm_y),
+        (body_center[0] + body_axes[0] + int(paper_width * 0.12), arm_y - int(paper_height * 0.05)),
+        (86, 178, 112),
+        3,
+        cv2.LINE_AA,
+    )
+    leg_top = body_center[1] + body_axes[1]
+    for sign in (-1, 1):
+        cv2.line(
+            paper,
+            (body_center[0] + sign * body_axes[0] // 2, leg_top),
+            (body_center[0] + sign * int(paper_width * 0.08), leg_top + int(paper_height * 0.09)),
+            (86, 178, 112),
+            3,
+            cv2.LINE_AA,
+        )
+
+    # 彩色星星
+    stars = (
+        (0.18, 0.10, (60, 200, 245)),
+        (0.12, 0.40, (200, 120, 230)),
+        (0.40, 0.20, (80, 180, 250)),
+        (0.30, 0.62, (90, 210, 120)),
+    )
+    for x_ratio, y_ratio, color in stars:
+        cv2.drawMarker(
+            paper,
+            (int(paper_width * x_ratio), int(paper_height * y_ratio)),
+            color,
+            cv2.MARKER_STAR,
+            max(12, paper_width // 28),
+            2,
+            cv2.LINE_AA,
+        )
+
+    # 二维码固定贴在画纸右上角
+    qr_core = int(paper_width * 0.38)
+    qr_image = _render_demo_qr(qr_text, qr_core)
+    qr_height, qr_width = qr_image.shape[:2]
+    qr_x = paper_width - qr_width - int(paper_width * 0.055)
+    qr_y = int(paper_height * 0.075)
+    paper[qr_y : qr_y + qr_height, qr_x : qr_x + qr_width] = qr_image
+    cv2.putText(
+        paper,
+        "SCAN ME",
+        (qr_x, qr_y + qr_height + int(paper_height * 0.035)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        max(0.45, paper_width / 650),
+        (70, 70, 70),
+        2,
+        cv2.LINE_AA,
+    )
+
+    # 底部彩色蜡笔线 + 标题
+    for index, color in enumerate(((90, 90, 230), (80, 180, 240), (80, 200, 120), (220, 150, 60))):
+        y = int(paper_height * 0.78) + index * max(5, paper_height // 80)
+        cv2.line(
+            paper,
+            (int(paper_width * 0.52), y),
+            (int(paper_width * 0.92), y + int(paper_height * 0.01)),
+            color,
+            3,
+            cv2.LINE_AA,
+        )
+    cv2.putText(
+        paper,
+        "MY ALIEN",
+        (int(paper_width * 0.08), int(paper_height * 0.93)),
+        cv2.FONT_HERSHEY_SCRIPT_SIMPLEX,
+        max(0.7, paper_width / 500),
+        (170, 80, 45),
+        2,
+        cv2.LINE_AA,
+    )
+
+    # 轻微旋转模拟手持摆放角度，同时保持二维码可识别
+    angle = math.sin(elapsed * 0.8) * 2.2
+    matrix = cv2.getRotationMatrix2D(
+        (paper_width / 2.0, paper_height / 2.0),
+        angle,
+        1.0,
+    )
+    rotated = cv2.warpAffine(
+        paper,
+        matrix,
+        (paper_width, paper_height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(18, 18, 16),
+    )
+
+    # 画纸在桌面上的轻微漂移
+    x = (width - paper_width) // 2 + int(math.sin(elapsed * 0.6) * width * 0.012)
+    y = (height - paper_height) // 2 + int(math.cos(elapsed * 0.45) * height * 0.015)
+    x = max(0, min(width - paper_width, x))
+    y = max(0, min(height - paper_height, y))
+    frame[y : y + paper_height, x : x + paper_width] = rotated
+
+    # 扫描取景框与演示标识
+    pad = 18
+    x0 = max(0, x - pad)
+    y0 = max(0, y - pad)
+    x1 = min(width - 1, x + paper_width + pad)
+    y1 = min(height - 1, y + paper_height + pad)
+    corner_length = max(20, int(min(width, height) * 0.04))
+    corner_color = (90, 230, 180)
+    for cx, cy, dx, dy in ((x0, y0, 1, 1), (x1, y0, -1, 1), (x0, y1, 1, -1), (x1, y1, -1, -1)):
+        cv2.line(frame, (cx, cy), (cx + dx * corner_length, cy), corner_color, 2, cv2.LINE_AA)
+        cv2.line(frame, (cx, cy), (cx, cy + dy * corner_length), corner_color, 2, cv2.LINE_AA)
+    demo_label = "DEMO MODE - simulated camera (no hardware)"
+    cv2.putText(
+        frame,
+        demo_label,
+        (16, height - 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (0, 0, 0),
+        4,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        demo_label,
+        (16, height - 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        corner_color,
+        1,
+        cv2.LINE_AA,
+    )
+    return frame
+
+
 def find_available_cameras(max_index: int = 5) -> List[Tuple[int, int, int]]:
     """探测前 ``max_index`` 路摄像头，返回 ``[(index, width, height), ...]``。"""
     available: List[Tuple[int, int, int]] = []
@@ -418,12 +648,56 @@ def _preview(camera_index: int, width: int, height: int) -> int:
     return 0
 
 
+def _demo(width: int, height: int) -> int:
+    """无摄像头演示模式：动态生成模拟画纸并实时识别二维码。"""
+    if not PYZBAR_AVAILABLE:
+        LOGGER.warning("pyzbar 不可用（%s），演示画面会正常显示但不会识别", PYZBAR_IMPORT_ERROR)
+
+    scanner = CameraScanner()
+    window_name = "Alien Garden - Demo Scanner (q/ESC)"
+    last_seen: dict[str, float] = {}
+    started = time.monotonic()
+    LOGGER.info("无摄像头演示模式已启动，按 q 或 ESC 退出")
+    try:
+        while True:
+            elapsed = time.monotonic() - started
+            frame = build_demo_frame(width, height, elapsed)
+            codes = scanner.scan_frame(frame)
+
+            now = time.monotonic()
+            for code in codes:
+                if now - last_seen.get(code.data, 0.0) > 2.0:
+                    last_seen[code.data] = now
+                    LOGGER.info("识别到演示二维码：%s（中心点 %s）", code.data, code.center)
+
+            cv2.imshow(window_name, annotate_frame(frame, codes))
+            key = cv2.waitKey(33) & 0xFF
+            if key in (27, ord("q")):
+                break
+            if key == ord("s"):
+                CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+                output_path = CAPTURE_DIR / f"demo_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+                cv2.imwrite(str(output_path), frame)
+                LOGGER.info("演示快照已保存：%s", output_path)
+    except KeyboardInterrupt:
+        LOGGER.info("用户中断演示")
+    finally:
+        scanner.release()
+        cv2.destroyAllWindows()
+    return 0
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="外星花园 · 摄像头与二维码识别工具")
     parser.add_argument("--camera", type=int, default=0, help="摄像头序号（默认 0）")
     parser.add_argument("--width", type=int, default=1920, help="采集宽度（默认 1920）")
     parser.add_argument("--height", type=int, default=1080, help="采集高度（默认 1080）")
     parser.add_argument("--image", type=Path, default=None, help="离线识别指定图片")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="无摄像头演示模式：生成模拟画纸并实时识别二维码",
+    )
     parser.add_argument(
         "--list-cameras",
         action="store_true",
@@ -449,6 +723,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not PYZBAR_AVAILABLE:
         LOGGER.warning("pyzbar 初始化失败：%s", PYZBAR_IMPORT_ERROR)
         LOGGER.warning("摄像头预览仍可用，但二维码识别会返回空结果。")
+
+    if args.demo:
+        return _demo(min(args.width, 1280), min(args.height, 720))
 
     if args.list_cameras:
         cameras = find_available_cameras()

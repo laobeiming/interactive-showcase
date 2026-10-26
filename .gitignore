@@ -20,6 +20,9 @@ captures/
 # 日志
 *.log
 
+# 本地演示素材（可由 scanner.py / 临时脚本重新生成）
+demo/
+
 # 操作系统文件
 .DS_Store
 Thumbs.db
