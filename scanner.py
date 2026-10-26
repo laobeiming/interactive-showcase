@@ -29,7 +29,8 @@ import logging
 import math
 import platform
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -153,7 +154,7 @@ class ScanStatus(str, Enum):
 
 
 STATUS_MESSAGES = {
-    ScanStatus.NO_PAPER: "未检测到图纸，请将手绘画作放入扫描区",
+    ScanStatus.NO_PAPER: "未检测到完整图纸，请将画作四边完整放入扫描区",
     ScanStatus.TILTED: "图纸倾斜，请摆正后重新扫描",
     ScanStatus.NO_CODE: "未识别到二维码，请将二维码对准扫描区",
     ScanStatus.READY: "识别成功，可以联动大屏",
@@ -186,6 +187,10 @@ class FrameAnalysis:
     def message(self) -> str:
         if self.status is ScanStatus.TILTED and self.pose.correction_hint:
             return self.pose.correction_hint
+        if self.status is ScanStatus.NO_PAPER:
+            if self.codes:
+                return "已识别二维码，请让整张纸的四边完整进入画面"
+            return "未识别到二维码，请将画作（含二维码）平放入扫描区"
         return STATUS_MESSAGES[self.status]
 
     @property
@@ -237,6 +242,9 @@ class CameraScanner:
         self.config = config or CameraConfig()
         self._capture: Optional[cv2.VideoCapture] = None
         self.last_error: Optional[str] = None
+        # 角度时序平滑：降低轮廓抖动造成的 HUD 数字跳动
+        self._angle_history: deque[float] = deque(maxlen=5)
+        self._pose_key: Optional[str] = None
 
     # ---- 设备管理 -----------------------------------------------------
     @property
@@ -343,6 +351,30 @@ class CameraScanner:
             LOGGER.info("摄像头已释放")
 
     # ---- 二维码识别 ---------------------------------------------------
+    def _smooth_pose(self, pose: PaperPose, key: Optional[str]) -> PaperPose:
+        """对连续帧的角度做向量平均，抑制 HUD 抖动与阈值边缘反复跳变。"""
+        if not pose.found:
+            self._angle_history.clear()
+            self._pose_key = None
+            return pose
+
+        if key != self._pose_key:
+            self._angle_history.clear()
+            self._pose_key = key
+        self._angle_history.append(pose.angle_deg)
+        if len(self._angle_history) < 3:
+            return pose
+
+        # 角度在 ±45° 处会回绕，使用 2θ 向量平均避免 44° 与 -44° 被判成 0°
+        sin_sum = sum(math.sin(math.radians(2.0 * angle)) for angle in self._angle_history)
+        cos_sum = sum(math.cos(math.radians(2.0 * angle)) for angle in self._angle_history)
+        smoothed = _normalize_angle(math.degrees(math.atan2(sin_sum, cos_sum)) / 2.0)
+        return replace(
+            pose,
+            angle_deg=smoothed,
+            needs_correction=abs(smoothed) > float(pose.tilt_threshold),
+        )
+
     def scan_frame(
         self,
         frame: np.ndarray,
@@ -444,20 +476,29 @@ class CameraScanner:
             primary = (
                 max(codes, key=lambda code: code.rect[2] * code.rect[3]) if codes else None
             )
-            pose = detect_paper_pose(
-                frame,
-                tilt_threshold=tilt_threshold,
-                min_area_ratio=min_paper_area_ratio,
-                hint_point=primary.center if primary is not None else None,
-            )
-            if not pose.found:
+            if primary is None:
+                # 没有二维码时不猜纸张轮廓：宁可提示“未识别二维码”，
+                # 也不要把天花板、窗户、墙面等亮区误框成图纸。
+                pose = PaperPose(found=False, tilt_threshold=tilt_threshold)
+                self._angle_history.clear()
+                self._pose_key = None
                 status = ScanStatus.NO_PAPER
-            elif pose.needs_correction:
-                status = ScanStatus.TILTED
-            elif not codes:
-                status = ScanStatus.NO_CODE
             else:
-                status = ScanStatus.READY
+                pose = detect_paper_pose(
+                    frame,
+                    tilt_threshold=tilt_threshold,
+                    min_area_ratio=min_paper_area_ratio,
+                    hint_point=primary.center,
+                    anchor_polygon=primary.polygon,
+                    anchor_rect=primary.rect,
+                )
+                pose = self._smooth_pose(pose, primary.data)
+                if not pose.found:
+                    status = ScanStatus.NO_PAPER
+                elif pose.needs_correction:
+                    status = ScanStatus.TILTED
+                else:
+                    status = ScanStatus.READY
         else:
             pose = PaperPose(found=False, tilt_threshold=tilt_threshold)
             status = ScanStatus.READY if codes else ScanStatus.NO_CODE
@@ -545,6 +586,118 @@ def _quad_tilt_deg(quad: Quad) -> float:
     return _normalize_angle(total / weight_sum)
 
 
+def _quad_corner_angles(quad: Quad) -> List[float]:
+    """返回四边形的四个内角（度），用于剔除三角形、细长条等伪四边形。"""
+    points = np.asarray(quad, dtype=np.float64)
+    angles: List[float] = []
+    for index in range(4):
+        previous = points[(index - 1) % 4]
+        current = points[index]
+        following = points[(index + 1) % 4]
+        first = previous - current
+        second = following - current
+        denominator = float(np.linalg.norm(first) * np.linalg.norm(second))
+        if denominator <= 1e-6:
+            continue
+        cosine = float(np.dot(first, second) / denominator)
+        angles.append(math.degrees(math.acos(max(-1.0, min(1.0, cosine)))))
+    return angles
+
+
+def _quad_contains_point(quad: Quad, point: Point) -> bool:
+    contour = np.asarray(quad, dtype=np.float32).reshape(-1, 1, 2)
+    return (
+        cv2.pointPolygonTest(contour, (float(point[0]), float(point[1])), False)
+        >= 0
+    )
+
+
+def _anchor_inside(
+    quad: Quad,
+    hint_point: Point,
+    anchor_polygon: Optional[Sequence[Point]],
+    anchor_rect: Optional[Rect],
+    quad_area: float,
+) -> bool:
+    """二维码必须是候选纸张的一部分，避免把天花板 / 窗户当成图纸。"""
+    if not _quad_contains_point(quad, hint_point):
+        return False
+
+    if anchor_polygon:
+        inside = sum(1 for point in anchor_polygon if _quad_contains_point(quad, point))
+        if inside < max(3, len(anchor_polygon) - 1):
+            return False
+
+    if anchor_rect is not None:
+        qr_area = max(1.0, float(anchor_rect[2]) * float(anchor_rect[3]))
+        # 纸张面积至少是二维码面积的 2 倍，排除只框住二维码的小四边形
+        if quad_area < qr_area * 2.0:
+            return False
+
+    return True
+
+
+def _quad_from_contour(
+    contour: np.ndarray,
+    box: np.ndarray,
+) -> Tuple[Quad, float]:
+    """优先用 approxPolyDP 贴合真实纸张边界，失败时退回最小外接矩形。"""
+    perimeter = cv2.arcLength(contour, True)
+    if perimeter > 0:
+        for ratio in (0.02, 0.03, 0.045, 0.06):
+            approx = cv2.approxPolyDP(contour, ratio * perimeter, True)
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                quad = _order_quad(approx.reshape(-1, 2))
+                quad_area = abs(
+                    float(cv2.contourArea(np.asarray(quad, dtype=np.float32)))
+                )
+                if quad_area > 0:
+                    return quad, quad_area
+
+    quad = _order_quad(box)
+    quad_area = abs(float(cv2.contourArea(box.astype(np.float32))))
+    return quad, quad_area
+
+
+def _paper_appearance(
+    gray: np.ndarray,
+    hsv: Optional[np.ndarray],
+    edges: np.ndarray,
+    quad: Quad,
+) -> Tuple[float, float, float, float]:
+    """统计候选区域的外观特征：(亮度, 饱和度, 灰度标准差, 内部边缘密度)。"""
+    mask = np.zeros(gray.shape, dtype=np.uint8)
+    cv2.fillConvexPoly(
+        mask,
+        np.asarray(quad, dtype=np.int32).reshape(-1, 1, 2),
+        255,
+    )
+    inner = cv2.erode(mask, np.ones((5, 5), np.uint8), iterations=2)
+    if cv2.countNonZero(inner) < 200:
+        inner = mask
+
+    pixel_count = float(cv2.countNonZero(inner))
+    if pixel_count <= 0:
+        return 0.0, 255.0, 255.0, 1.0
+
+    selected = inner > 0
+    gray_values = gray[selected]
+    mean_gray = float(gray_values.mean())
+    std_gray = float(gray_values.std())
+    edge_density = float(
+        cv2.countNonZero(cv2.bitwise_and(edges, inner)) / pixel_count
+    )
+
+    if hsv is not None:
+        saturation = float(hsv[..., 1][selected].mean())
+        value = float(hsv[..., 2][selected].mean())
+    else:
+        saturation = 0.0
+        value = mean_gray
+
+    return value, saturation, std_gray, edge_density
+
+
 def _paper_masks(gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """生成两套候选掩膜：边缘轮廓 + Otsu 亮纸区域。
 
@@ -573,108 +726,158 @@ def detect_paper_pose(
     min_area_ratio: float = DEFAULT_MIN_PAPER_AREA_RATIO,
     max_area_ratio: float = DEFAULT_MAX_PAPER_AREA_RATIO,
     hint_point: Optional[Point] = None,
+    anchor_polygon: Optional[Sequence[Point]] = None,
+    anchor_rect: Optional[Rect] = None,
 ) -> PaperPose:
     """基于轮廓检测估算图纸摆放的水平角。
 
     处理流程：
     1. 灰度化 + 高斯模糊，生成 Canny 边缘掩膜与 Otsu 亮区掩膜；
-    2. ``findContours`` 提取外轮廓，用 ``minAreaRect`` 拟合最小外接矩形；
-    3. 按面积占比、矩形度、长宽比筛选，打分取最优候选；
-    4. 由四条边角度加权平均得到倾斜角，超过阈值时 ``needs_correction=True``。
+    2. ``findContours`` 提取外轮廓，用 ``approxPolyDP`` / ``minAreaRect`` 拟合四边形；
+    3. 按面积、矩形度、长宽比、凸性、四角角度、白纸外观筛选候选；
+    4. 有二维码时要求二维码落在纸张内部（锚定），彻底排除天花板、窗户等大亮块；
+    5. 由四条边角度加权平均得到倾斜角，超过阈值时 ``needs_correction=True``。
 
     Args:
         frame: OpenCV BGR / 灰度图像。
         tilt_threshold: 允许的最大倾斜角（度），默认 8°。
         min_area_ratio: 图纸最小面积占比。
         max_area_ratio: 图纸最大面积占比。
-        hint_point: 二维码中心点。提供时会优先选择包含该点的矩形，
-            避免把窗户、墙面等大面积矩形误判为图纸。
+        hint_point: 二维码中心点。提供时只接受包含该点的候选，用于锚定真实纸张。
+        anchor_polygon: 二维码四个角点，提供时要求角点也落在纸张内部。
+        anchor_rect: 二维码外接矩形，用于排除“只框住二维码”的小四边形。
 
     Returns:
-        ``PaperPose``；未找到图纸时 ``found=False``。
+        ``PaperPose``；未找到完整图纸时 ``found=False``。
     """
     if frame is None or getattr(frame, "size", 0) == 0:
         return PaperPose(found=False, tilt_threshold=tilt_threshold)
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV) if frame.ndim == 3 else None
     frame_height, frame_width = gray.shape[:2]
     frame_area = float(frame_height * frame_width)
     if frame_area <= 0:
         return PaperPose(found=False, tilt_threshold=tilt_threshold)
     min_area = frame_area * max(0.001, float(min_area_ratio))
+    anchored = hint_point is not None
+
+    edges, bright = _paper_masks(gray)
 
     best_quad: Optional[Quad] = None
     best_area_ratio = 0.0
     best_confidence = 0.0
     best_score = -1.0
 
-    for mask in _paper_masks(gray):
-        contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+    for mask in (edges, bright):
+        raw_contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+        contours = sorted(raw_contours, key=cv2.contourArea, reverse=True)[:12]
         for contour in contours:
-            area = float(cv2.contourArea(contour))
-            if area < min_area:
+            contour_area = abs(float(cv2.contourArea(contour)))
+            if contour_area < min_area * 0.8:
                 continue
 
-            (_, _), (box_width, box_height), _ = cv2.minAreaRect(contour)
-            if box_width < 2.0 or box_height < 2.0:
+            rect_fit = cv2.minAreaRect(contour)
+            box_width, box_height = rect_fit[1]
+            if min(box_width, box_height) < 40.0:
                 continue
 
-            quad_area = float(box_width * box_height)
-            area_ratio = quad_area / frame_area
+            box = cv2.boxPoints(rect_fit)
+            box_area = abs(float(cv2.contourArea(box.astype(np.float32))))
+            if box_area <= 0:
+                continue
+
+            area_ratio = box_area / frame_area
             if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
                 continue
 
-            rectangularity = area / quad_area  # 轮廓填充程度，矩形纸张接近 1
-            if rectangularity < 0.62:
+            rectangularity = contour_area / box_area
+            if rectangularity < (0.66 if anchored else 0.70):
                 continue
 
             aspect = min(box_width, box_height) / max(box_width, box_height)
-            if aspect < 0.30:  # 过滤细长条、桌沿等干扰
+            if anchored:
+                if aspect < 0.42 or aspect > 2.10:
+                    continue
+            elif aspect < 0.50 or aspect > 1.85:
                 continue
 
             try:
-                quad = _order_quad(cv2.boxPoints(cv2.minAreaRect(contour)))
+                quad, quad_area = _quad_from_contour(contour, box)
             except (ValueError, cv2.error):
+                continue
+            if quad_area <= 0.0 or quad_area / frame_area > max_area_ratio:
+                continue
+
+            corners = _quad_corner_angles(quad)
+            if len(corners) != 4 or min(corners) < 52.0 or max(corners) > 128.0:
                 continue
 
             xs = [point[0] for point in quad]
             ys = [point[1] for point in quad]
-            touches_border = (
-                min(xs) <= 2
-                or min(ys) <= 2
-                or max(xs) >= frame_width - 3
-                or max(ys) >= frame_height - 3
+            # 四角被画面裁掉时无法还原真实角度，直接放弃该候选
+            if (
+                min(xs) <= 3
+                or min(ys) <= 3
+                or max(xs) >= frame_width - 4
+                or max(ys) >= frame_height - 4
+            ):
+                continue
+
+            # 有二维码时，纸张必须包住二维码；没有二维码时才走严格的白纸外观筛选
+            if anchored:
+                assert hint_point is not None
+                if not _anchor_inside(
+                    quad,
+                    hint_point,
+                    anchor_polygon,
+                    anchor_rect,
+                    quad_area,
+                ):
+                    continue
+
+            value, saturation, gray_std, edge_density = _paper_appearance(
+                gray, hsv, edges, quad
             )
+            if anchored:
+                if value < 85.0 or saturation > 140.0:
+                    continue
+            else:
+                center_y_ratio = (min(ys) + max(ys)) / 2.0 / frame_height
+                if center_y_ratio < 0.25:  # 画面上方多为天花板 / 灯带，直接排除
+                    continue
+                if value < 110.0 or saturation > 100.0:
+                    continue
+                # 儿童画本身包含线条与二维码，允许一定的灰度波动和边缘密度
+                if gray_std > 85.0 or edge_density > 0.30:
+                    continue
 
-            # 大面积优先，同时兼顾矩形度与长宽比；贴近画面边缘时略降权重
-            score = area_ratio * (0.60 + 0.40 * rectangularity) * (0.85 + 0.15 * aspect)
-            if touches_border:
-                score *= 0.85
+            aspect_score = 1.0 - min(1.0, abs(aspect - 0.707) / 0.707)
+            whiteness = min(1.0, max(0.0, (value - 80.0) / 120.0))
+            uniformity = max(0.0, 1.0 - gray_std / 80.0)
+            cleanness = max(0.0, 1.0 - edge_density / 0.30)
+            appearance = 0.50 * whiteness + 0.25 * uniformity + 0.25 * cleanness
 
-            # 二维码中心点位于纸张内部时提高权重，避免窗户等大矩形抢占结果
-            if hint_point is not None:
-                hint_x, hint_y = float(hint_point[0]), float(hint_point[1])
-                inside = cv2.pointPolygonTest(
-                    np.array(quad, dtype=np.int32),
-                    (hint_x, hint_y),
-                    False,
-                ) >= 0
-                score *= 1.15 if inside else 0.40
-
-            # 扫描台中心区域优先，进一步抑制画面边缘的窗框、桌沿
             center_x = (min(xs) + max(xs)) / 2.0 / frame_width
             center_y = (min(ys) + max(ys)) / 2.0 / frame_height
             centrality = max(
                 0.0,
                 1.0 - math.hypot(center_x - 0.5, center_y - 0.5) * 1.6,
             )
-            score *= 0.90 + 0.10 * centrality
+            score = (
+                area_ratio
+                * (0.55 + 0.45 * rectangularity)
+                * (0.70 + 0.30 * aspect_score)
+                * (0.90 + 0.10 * centrality)
+                * (0.65 + 0.35 * appearance)
+            )
+            score *= 1.55 if anchored else 0.90
 
             if score > best_score:
                 best_score = score
                 best_quad = quad
-                best_area_ratio = area_ratio
-                best_confidence = min(1.0, score)
+                best_area_ratio = quad_area / frame_area
+                best_confidence = min(1.0, 0.35 + 0.65 * appearance)
 
     if best_quad is None:
         return PaperPose(found=False, tilt_threshold=tilt_threshold)
