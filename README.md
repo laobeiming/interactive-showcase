@@ -96,6 +96,12 @@ python main.py --start-camera --tilt-threshold 8 --min-paper-ratio 0.04
 python main.py --start-camera --camera 1 --width 1920 --height 1080
 ```
 - 扫描页按 **C** 打开摄像头 / 返回待机；联动页按 **C** 立即返回扫描页。
+
+**Windows 一键启动（推荐日常调试）**
+- 双击 `start_camera.bat`：直接打开摄像头 + 二维码识别预览（`q / ESC` 退出，`s` 保存快照）。
+- 双击 `start_show.bat`：阶段二完整联动（窗口模式，`C` 切换扫描/待机，`ESC` 退出）。
+- 指定摄像头编号时，在命令行执行 `start_camera.bat 1`（不传参数默认 0 号摄像头）。
+
 - 二维码内置主题关键字：`GARDEN / ALIEN`（外星花园）、`OCEAN / SEA / AQUA`（深海星潮）、`FOREST / TREE`（荧光森林）、`DESERT / SAND`（赤砂星球）；未知 ID 使用稳定兜底主题。
 
 ### 3. 终端自检与测试（无需界面）
