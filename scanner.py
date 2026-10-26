@@ -1,19 +1,22 @@
-"""摄像头采集与二维码识别模块（阶段一骨架）。
+"""摄像头采集、二维码识别与图纸摆放角度校准模块（阶段二）。
 
-本模块只负责“看得见、读得出”：
+本模块负责“看得见、读得出、摆得正”：
 * 封装 OpenCV 摄像头的打开、读取、释放与热插拔容错；
 * 封装 pyzbar 二维码识别，输出二维码内容、位置与中心点；
-* 提供独立命令行预览工具，便于现场调试高拍仪。
+* 基于轮廓检测估算图纸摆放的水平倾斜角，倾斜超标时输出校正信号；
+* 提供独立命令行预览 / 终端探测 / 算法自检工具，便于现场调试高拍仪。
 
-后续阶段可直接复用 ``CameraScanner.scan_frame()``，把识别到的二维码 ID
-交给纸张姿态检测与场景联动模块。
+上层（``main.py``）通过 ``CameraScanner.analyze_frame()`` 一次性获得
+二维码与图纸姿态，再决定是否联动大屏。
 
 命令行示例：
-    python scanner.py                     # 默认摄像头预览
-    python scanner.py --camera 1          # 指定第二路摄像头
-    python scanner.py --image qr.png      # 离线识别单张图片
-    python scanner.py --list-cameras      # 探测可用摄像头
-    python scanner.py --demo              # 无摄像头演示（模拟画纸 + 二维码）
+    python scanner.py                      # 默认摄像头预览
+    python scanner.py --camera 1           # 指定第二路摄像头
+    python scanner.py --image qr.png       # 离线识别单张图片
+    python scanner.py --list-cameras       # 探测可用摄像头
+    python scanner.py --probe --frames 30  # 无窗口抓取 30 帧并打印分析结果
+    python scanner.py --selftest           # 合成图算法自检（不需要摄像头）
+    python scanner.py --demo               # 无摄像头演示（模拟画纸 + 二维码）
 
 预览窗口按键：q / ESC 退出，s 保存当前帧快照。
 """
@@ -21,13 +24,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import platform
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -38,7 +43,15 @@ PROJECT_DIR = Path(__file__).resolve().parent
 CAPTURE_DIR = PROJECT_DIR / "captures"
 
 Point = Tuple[int, int]
+Quad = Tuple[Point, Point, Point, Point]
 Rect = Tuple[int, int, int, int]
+
+# 图纸水平角阈值：|倾斜角| 超过该值即认为需要校正摆放
+DEFAULT_TILT_THRESHOLD_DEG = 8.0
+# 图纸至少占画面面积的比例，过滤桌面纹理、二维码小方块等误检
+DEFAULT_MIN_PAPER_AREA_RATIO = 0.04
+# 图纸最多占画面面积的比例，避免把整幅画面边框当成图纸
+DEFAULT_MAX_PAPER_AREA_RATIO = 0.92
 
 # pyzbar 导入失败通常是缺少 libzbar 动态库；此时摄像头预览仍可使用，
 # 只是二维码识别返回空结果，并通过 last_error 告知上层。
@@ -78,26 +91,144 @@ class QRCode:
         }
 
 
+@dataclass(frozen=True)
+class PaperPose:
+    """图纸摆放姿态（基于轮廓检测估算）。
+
+    ``angle_deg`` 为图纸上边缘相对水平线的倾角，范围约 ``[-45, 45]``：
+
+    * 正数：图纸右侧偏下，需要**逆时针**回正；
+    * 负数：图纸右侧偏上，需要**顺时针**回正。
+    """
+
+    found: bool
+    angle_deg: float = 0.0
+    quad: Quad = ((0, 0), (0, 0), (0, 0), (0, 0))
+    rect: Optional[Rect] = None
+    area_ratio: float = 0.0
+    confidence: float = 0.0
+    tilt_threshold: float = DEFAULT_TILT_THRESHOLD_DEG
+    needs_correction: bool = False
+
+    @property
+    def center(self) -> Point:
+        if self.rect is None:
+            return (0, 0)
+        x, y, width, height = self.rect
+        return (x + width // 2, y + height // 2)
+
+    @property
+    def abs_angle(self) -> float:
+        return abs(self.angle_deg)
+
+    @property
+    def correction_hint(self) -> str:
+        """给操作者看的回正方向提示（未超标时为空字符串）。"""
+        if not self.found or not self.needs_correction:
+            return ""
+        direction = "逆时针" if self.angle_deg > 0 else "顺时针"
+        return f"请{direction}旋转图纸约 {self.abs_angle:.1f}°"
+
+    def to_dict(self) -> dict:
+        return {
+            "found": self.found,
+            "angle_deg": round(self.angle_deg, 2),
+            "needs_correction": self.needs_correction,
+            "tilt_threshold": self.tilt_threshold,
+            "quad": [list(point) for point in self.quad] if self.found else [],
+            "rect": self.rect,
+            "center": self.center,
+            "area_ratio": round(self.area_ratio, 4),
+            "confidence": round(self.confidence, 4),
+        }
+
+
+class ScanStatus(str, Enum):
+    """一帧画面的综合扫描状态。"""
+
+    NO_PAPER = "no_paper"      # 未检测到图纸
+    TILTED = "tilted"          # 检测到图纸但倾斜超标
+    NO_CODE = "no_code"        # 图纸水平但未识别到二维码
+    READY = "ready"            # 图纸水平且二维码识别成功，可联动
+
+
+STATUS_MESSAGES = {
+    ScanStatus.NO_PAPER: "未检测到图纸，请将手绘画作放入扫描区",
+    ScanStatus.TILTED: "图纸倾斜，请摆正后重新扫描",
+    ScanStatus.NO_CODE: "未识别到二维码，请将二维码对准扫描区",
+    ScanStatus.READY: "识别成功，可以联动大屏",
+}
+
+
+@dataclass(frozen=True)
+class FrameAnalysis:
+    """一帧图像的综合分析结果：二维码 + 图纸姿态 + 联动状态。"""
+
+    status: ScanStatus
+    codes: Tuple[QRCode, ...] = ()
+    pose: PaperPose = PaperPose(found=False)
+    frame_size: Tuple[int, int] = (0, 0)
+    timestamp: float = 0.0
+
+    @property
+    def primary_code(self) -> Optional[QRCode]:
+        """返回面积最大的二维码，作为当前画作的主 ID。"""
+        if not self.codes:
+            return None
+        return max(self.codes, key=lambda code: code.rect[2] * code.rect[3])
+
+    @property
+    def code_data(self) -> Optional[str]:
+        code = self.primary_code
+        return code.data if code is not None else None
+
+    @property
+    def message(self) -> str:
+        if self.status is ScanStatus.TILTED and self.pose.correction_hint:
+            return self.pose.correction_hint
+        return STATUS_MESSAGES[self.status]
+
+    @property
+    def needs_correction(self) -> bool:
+        return self.status is ScanStatus.TILTED
+
+    @property
+    def ready(self) -> bool:
+        return self.status is ScanStatus.READY
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status.value,
+            "message": self.message,
+            "codes": [code.to_dict() for code in self.codes],
+            "pose": self.pose.to_dict(),
+            "frame_size": list(self.frame_size),
+            "timestamp": round(self.timestamp, 3),
+        }
+
+
 @dataclass
 class CameraConfig:
     """摄像头采集参数，后续可由配置文件覆盖。"""
 
     index: int = 0
-    width: int = 1920
-    height: int = 1080
+    width: int = 1280
+    height: int = 720
     fps: int = 30
-    warmup_frames: int = 5
+    warmup_frames: int = 8
+    read_retries: int = 3
+    open_timeout: float = 2.0
 
 
 class CameraScanner:
-    """摄像头 + 二维码识别的统一入口。
+    """摄像头 + 二维码识别 + 图纸姿态校准的统一入口。
 
     典型用法::
 
         with CameraScanner(CameraConfig(index=0)) as scanner:
-            frame, codes = scanner.scan_once()
-            for code in codes:
-                print(code.data, code.center)
+            analysis = scanner.analyze_frame(scanner.read_frame())
+            if analysis.ready:
+                print(analysis.code_data)
 
     该类不依赖 Qt，可在主线程之外复用；但 OpenCV 的窗口操作需留在主线程。
     """
@@ -112,49 +243,80 @@ class CameraScanner:
     def is_open(self) -> bool:
         return self._capture is not None and self._capture.isOpened()
 
-    def open(self) -> bool:
-        """打开摄像头并完成预热，成功返回 True。"""
-        if self.is_open:
-            return True
-
-        self.last_error = None
-        backend = cv2.CAP_DSHOW if IS_WINDOWS else cv2.CAP_ANY
-        LOGGER.debug("尝试打开摄像头 index=%s backend=%s", self.config.index, backend)
-        capture = cv2.VideoCapture(self.config.index, backend)
-
-        # DirectShow 偶发失败时，退回系统默认后端再试一次
-        if not capture.isOpened() and backend != cv2.CAP_ANY:
-            capture.release()
-            LOGGER.debug("DirectShow 打开失败，尝试系统默认后端")
-            capture = cv2.VideoCapture(self.config.index)
-
-        if not capture.isOpened():
-            capture.release()
-            self.last_error = f"无法打开摄像头 index={self.config.index}（设备被占用或未连接）"
-            LOGGER.error(self.last_error)
-            return False
-
+    def _apply_capture_settings(self, capture: cv2.VideoCapture) -> None:
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
         capture.set(cv2.CAP_PROP_FPS, self.config.fps)
         if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 尽量取最新帧，降低识别延迟
 
-        self._capture = capture
-        for _ in range(max(0, self.config.warmup_frames)):
-            capture.read()
+    def _warm_up(self, capture: cv2.VideoCapture) -> bool:
+        """等待摄像头真正出图。
 
-        actual_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        actual_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        actual_fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
-        LOGGER.info(
-            "摄像头已打开：index=%s，分辨率=%sx%s，FPS=%.1f",
-            self.config.index,
-            actual_width,
-            actual_height,
-            actual_fps,
-        )
-        return True
+        Windows 下 DirectShow / MSMF 打开成功后，前几帧读取失败是常见现象；
+        这里按时间窗口重试，避免 ``--list-cameras`` 或启动阶段误判为无设备。
+        """
+        deadline = time.monotonic() + max(0.2, float(self.config.open_timeout))
+        good_frames = 0
+        while time.monotonic() < deadline:
+            ok, frame = capture.read()
+            if ok and frame is not None:
+                good_frames += 1
+                if good_frames >= max(1, int(self.config.warmup_frames)):
+                    return True
+            else:
+                time.sleep(0.03)
+        return good_frames > 0
+
+    def open(self) -> bool:
+        """打开摄像头并完成预热，成功返回 True。"""
+        if self.is_open:
+            return True
+
+        self.last_error = None
+        if IS_WINDOWS:
+            backends = (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY)
+        else:
+            backends = (cv2.CAP_ANY,)
+
+        failure_reason = "设备被占用或未连接"
+        for backend in backends:
+            LOGGER.debug("尝试打开摄像头 index=%s backend=%s", self.config.index, backend)
+            capture = cv2.VideoCapture(self.config.index, backend)
+            if not capture.isOpened():
+                capture.release()
+                failure_reason = f"backend={backend} 无法打开"
+                continue
+
+            try:
+                self._apply_capture_settings(capture)
+                if not self._warm_up(capture):
+                    capture.release()
+                    failure_reason = f"backend={backend} 打开后无法读取画面"
+                    continue
+            except Exception as exc:  # 驱动异常时继续尝试下一个后端
+                capture.release()
+                failure_reason = f"backend={backend} 初始化异常：{type(exc).__name__}: {exc}"
+                LOGGER.debug(failure_reason)
+                continue
+
+            self._capture = capture
+            actual_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            actual_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            actual_fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
+            LOGGER.info(
+                "摄像头已打开：index=%s，backend=%s，分辨率=%sx%s，FPS=%.1f",
+                self.config.index,
+                backend,
+                actual_width,
+                actual_height,
+                actual_fps,
+            )
+            return True
+
+        self.last_error = f"无法打开摄像头 index={self.config.index}（{failure_reason}）"
+        LOGGER.error(self.last_error)
+        return False
 
     def read_frame(self) -> Optional[np.ndarray]:
         """读取一帧 BGR 图像；失败时返回 None 并更新 last_error。"""
@@ -162,12 +324,17 @@ class CameraScanner:
             return None
 
         assert self._capture is not None
-        ok, frame = self._capture.read()
-        if not ok or frame is None:
-            self.last_error = "摄像头读取失败（设备被占用或已断开）"
-            LOGGER.warning(self.last_error)
-            return None
-        return frame
+        for attempt in range(max(1, int(self.config.read_retries))):
+            ok, frame = self._capture.read()
+            if ok and frame is not None:
+                self.last_error = None
+                return frame
+            if attempt + 1 < self.config.read_retries:
+                time.sleep(0.02)
+
+        self.last_error = "摄像头读取失败（设备被占用或已断开）"
+        LOGGER.warning(self.last_error)
+        return None
 
     def release(self) -> None:
         if self._capture is not None:
@@ -245,6 +412,64 @@ class CameraScanner:
             self.last_error = None
         return results
 
+    def analyze_frame(
+        self,
+        frame: np.ndarray,
+        *,
+        roi: Optional[Rect] = None,
+        tilt_threshold: float = DEFAULT_TILT_THRESHOLD_DEG,
+        min_paper_area_ratio: float = DEFAULT_MIN_PAPER_AREA_RATIO,
+        detect_pose: bool = True,
+    ) -> FrameAnalysis:
+        """一次性完成二维码识别 + 图纸水平角校准，返回联动状态。
+
+        Args:
+            frame: OpenCV BGR 图像。
+            roi: 可选的二维码识别区域 ``(x, y, w, h)``。
+            tilt_threshold: 允许的最大水平倾斜角（度）。
+            min_paper_area_ratio: 图纸最小面积占比，过滤小面积误检。
+            detect_pose: 关闭后只做二维码识别（兼容旧流程 / 性能调试）。
+
+        Returns:
+            ``FrameAnalysis``；``status`` 为 ``READY`` 时上层可安全触发联动。
+        """
+        if frame is None or getattr(frame, "size", 0) == 0:
+            self.last_error = "待分析图像为空"
+            return FrameAnalysis(status=ScanStatus.NO_PAPER, timestamp=time.time())
+
+        frame_height, frame_width = frame.shape[:2]
+        codes = self.scan_frame(frame, roi=roi)
+
+        if detect_pose:
+            primary = (
+                max(codes, key=lambda code: code.rect[2] * code.rect[3]) if codes else None
+            )
+            pose = detect_paper_pose(
+                frame,
+                tilt_threshold=tilt_threshold,
+                min_area_ratio=min_paper_area_ratio,
+                hint_point=primary.center if primary is not None else None,
+            )
+            if not pose.found:
+                status = ScanStatus.NO_PAPER
+            elif pose.needs_correction:
+                status = ScanStatus.TILTED
+            elif not codes:
+                status = ScanStatus.NO_CODE
+            else:
+                status = ScanStatus.READY
+        else:
+            pose = PaperPose(found=False, tilt_threshold=tilt_threshold)
+            status = ScanStatus.READY if codes else ScanStatus.NO_CODE
+
+        return FrameAnalysis(
+            status=status,
+            codes=tuple(codes),
+            pose=pose,
+            frame_size=(frame_width, frame_height),
+            timestamp=time.time(),
+        )
+
     def scan_once(self, roi: Optional[Rect] = None) -> Tuple[Optional[np.ndarray], List[QRCode]]:
         """抓取一帧并立即识别，返回 ``(frame, codes)``。"""
         frame = self.read_frame()
@@ -261,10 +486,271 @@ class CameraScanner:
         self.release()
 
 
+def _normalize_angle(deg: float) -> float:
+    """把任意直线角度归一化到 ``(-45, 45]``，用于求“相对水平/垂直”的偏差。"""
+    while deg <= -45.0:
+        deg += 90.0
+    while deg > 45.0:
+        deg -= 90.0
+    return deg
+
+
+def _order_quad(points: np.ndarray) -> Quad:
+    """把任意顺序的四个角点整理为 左上、右上、右下、左下。"""
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    if pts.shape[0] != 4:
+        raise ValueError("需要恰好四个角点")
+
+    ordered = np.zeros((4, 2), dtype=np.float32)
+    sums = pts.sum(axis=1)
+    diffs = np.diff(pts, axis=1).reshape(-1)
+    ordered[0] = pts[int(np.argmin(sums))]  # 左上：x+y 最小
+    ordered[2] = pts[int(np.argmax(sums))]  # 右下：x+y 最大
+    ordered[1] = pts[int(np.argmin(diffs))]  # 右上：y-x 最小
+    ordered[3] = pts[int(np.argmax(diffs))]  # 左下：y-x 最大
+
+    # 极端旋转时上述规则可能得到重复点，退回按极角排序
+    if len({tuple(point) for point in ordered}) < 4:
+        center = pts.mean(axis=0)
+        angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
+        pts = pts[np.argsort(angles)]
+        start = int(np.argmin(pts.sum(axis=1)))
+        pts = np.roll(pts, -start, axis=0)
+        ordered = pts
+
+    return (
+        (int(round(float(ordered[0][0]))), int(round(float(ordered[0][1])))),
+        (int(round(float(ordered[1][0]))), int(round(float(ordered[1][1])))),
+        (int(round(float(ordered[2][0]))), int(round(float(ordered[2][1])))),
+        (int(round(float(ordered[3][0]))), int(round(float(ordered[3][1])))),
+    )
+
+
+def _quad_tilt_deg(quad: Quad) -> float:
+    """按四条边的加权平均，计算图纸相对水平线的倾斜角。"""
+    tl, tr, br, bl = (np.array(point, dtype=np.float64) for point in quad)
+    edges = ((tl, tr), (bl, br), (tl, bl), (tr, br))
+    total = 0.0
+    weight_sum = 0.0
+    for start, end in edges:
+        delta = end - start
+        length = float(np.hypot(delta[0], delta[1]))
+        if length < 8.0:  # 太短的边受噪声影响大，直接忽略
+            continue
+        raw_angle = math.degrees(math.atan2(float(delta[1]), float(delta[0])))
+        total += _normalize_angle(raw_angle) * length
+        weight_sum += length
+    if weight_sum <= 0.0:
+        return 0.0
+    return _normalize_angle(total / weight_sum)
+
+
+def _paper_masks(gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """生成两套候选掩膜：边缘轮廓 + Otsu 亮纸区域。
+
+    高拍仪下白纸与深色桌面对比明显，Otsu 很稳；当纸张颜色接近桌面时，
+    边缘轮廓可以补足。两套掩膜都交给 ``findContours``，取评分最高者。
+    """
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    median = float(np.median(blurred))
+    lower = int(max(0.0, 0.66 * median))
+    upper = int(min(255.0, max(lower + 30.0, 1.33 * median)))
+    edges = cv2.Canny(blurred, lower, upper)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=2)
+
+    _, bright = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=2)
+    bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
+    return edges, bright
+
+
+def detect_paper_pose(
+    frame: np.ndarray,
+    *,
+    tilt_threshold: float = DEFAULT_TILT_THRESHOLD_DEG,
+    min_area_ratio: float = DEFAULT_MIN_PAPER_AREA_RATIO,
+    max_area_ratio: float = DEFAULT_MAX_PAPER_AREA_RATIO,
+    hint_point: Optional[Point] = None,
+) -> PaperPose:
+    """基于轮廓检测估算图纸摆放的水平角。
+
+    处理流程：
+    1. 灰度化 + 高斯模糊，生成 Canny 边缘掩膜与 Otsu 亮区掩膜；
+    2. ``findContours`` 提取外轮廓，用 ``minAreaRect`` 拟合最小外接矩形；
+    3. 按面积占比、矩形度、长宽比筛选，打分取最优候选；
+    4. 由四条边角度加权平均得到倾斜角，超过阈值时 ``needs_correction=True``。
+
+    Args:
+        frame: OpenCV BGR / 灰度图像。
+        tilt_threshold: 允许的最大倾斜角（度），默认 8°。
+        min_area_ratio: 图纸最小面积占比。
+        max_area_ratio: 图纸最大面积占比。
+        hint_point: 二维码中心点。提供时会优先选择包含该点的矩形，
+            避免把窗户、墙面等大面积矩形误判为图纸。
+
+    Returns:
+        ``PaperPose``；未找到图纸时 ``found=False``。
+    """
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return PaperPose(found=False, tilt_threshold=tilt_threshold)
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    frame_height, frame_width = gray.shape[:2]
+    frame_area = float(frame_height * frame_width)
+    if frame_area <= 0:
+        return PaperPose(found=False, tilt_threshold=tilt_threshold)
+    min_area = frame_area * max(0.001, float(min_area_ratio))
+
+    best_quad: Optional[Quad] = None
+    best_area_ratio = 0.0
+    best_confidence = 0.0
+    best_score = -1.0
+
+    for mask in _paper_masks(gray):
+        contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < min_area:
+                continue
+
+            (_, _), (box_width, box_height), _ = cv2.minAreaRect(contour)
+            if box_width < 2.0 or box_height < 2.0:
+                continue
+
+            quad_area = float(box_width * box_height)
+            area_ratio = quad_area / frame_area
+            if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+                continue
+
+            rectangularity = area / quad_area  # 轮廓填充程度，矩形纸张接近 1
+            if rectangularity < 0.62:
+                continue
+
+            aspect = min(box_width, box_height) / max(box_width, box_height)
+            if aspect < 0.30:  # 过滤细长条、桌沿等干扰
+                continue
+
+            try:
+                quad = _order_quad(cv2.boxPoints(cv2.minAreaRect(contour)))
+            except (ValueError, cv2.error):
+                continue
+
+            xs = [point[0] for point in quad]
+            ys = [point[1] for point in quad]
+            touches_border = (
+                min(xs) <= 2
+                or min(ys) <= 2
+                or max(xs) >= frame_width - 3
+                or max(ys) >= frame_height - 3
+            )
+
+            # 大面积优先，同时兼顾矩形度与长宽比；贴近画面边缘时略降权重
+            score = area_ratio * (0.60 + 0.40 * rectangularity) * (0.85 + 0.15 * aspect)
+            if touches_border:
+                score *= 0.85
+
+            # 二维码中心点位于纸张内部时提高权重，避免窗户等大矩形抢占结果
+            if hint_point is not None:
+                hint_x, hint_y = float(hint_point[0]), float(hint_point[1])
+                inside = cv2.pointPolygonTest(
+                    np.array(quad, dtype=np.int32),
+                    (hint_x, hint_y),
+                    False,
+                ) >= 0
+                score *= 1.15 if inside else 0.40
+
+            # 扫描台中心区域优先，进一步抑制画面边缘的窗框、桌沿
+            center_x = (min(xs) + max(xs)) / 2.0 / frame_width
+            center_y = (min(ys) + max(ys)) / 2.0 / frame_height
+            centrality = max(
+                0.0,
+                1.0 - math.hypot(center_x - 0.5, center_y - 0.5) * 1.6,
+            )
+            score *= 0.90 + 0.10 * centrality
+
+            if score > best_score:
+                best_score = score
+                best_quad = quad
+                best_area_ratio = area_ratio
+                best_confidence = min(1.0, score)
+
+    if best_quad is None:
+        return PaperPose(found=False, tilt_threshold=tilt_threshold)
+
+    tilt_deg = _quad_tilt_deg(best_quad)
+    xs = [point[0] for point in best_quad]
+    ys = [point[1] for point in best_quad]
+    x0 = max(0, min(xs))
+    y0 = max(0, min(ys))
+    x1 = min(frame_width, max(xs))
+    y1 = min(frame_height, max(ys))
+    rect: Rect = (x0, y0, max(0, x1 - x0), max(0, y1 - y0))
+
+    return PaperPose(
+        found=True,
+        angle_deg=tilt_deg,
+        quad=best_quad,
+        rect=rect,
+        area_ratio=best_area_ratio,
+        confidence=best_confidence,
+        tilt_threshold=tilt_threshold,
+        needs_correction=abs(tilt_deg) > float(tilt_threshold),
+    )
+
+
 def _ascii_label(text: str, limit: int = 48) -> str:
     """OpenCV 的 putText 只支持 ASCII，预览窗口里把非 ASCII 字符替换掉。"""
     safe = text.encode("ascii", errors="replace").decode("ascii")
     return safe if len(safe) <= limit else safe[: limit - 3] + "..."
+
+
+def _put_text(
+    canvas: np.ndarray,
+    text: str,
+    position: Point,
+    color: Tuple[int, int, int],
+    *,
+    scale: float = 0.65,
+    thickness: int = 2,
+) -> None:
+    """带黑色描边的 OpenCV 文本，保证复杂背景下也能看清。"""
+    cv2.putText(
+        canvas,
+        text,
+        position,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (0, 0, 0),
+        thickness + 3,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        text,
+        position,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+_STATUS_ASCII = {
+    ScanStatus.NO_PAPER: "STATUS: NO PAPER",
+    ScanStatus.TILTED: "STATUS: TILTED - LEVEL THE PAPER",
+    ScanStatus.NO_CODE: "STATUS: PAPER OK - NO QR CODE",
+    ScanStatus.READY: "STATUS: READY - LINK NOW",
+}
+
+_STATUS_COLORS = {
+    ScanStatus.NO_PAPER: (205, 205, 205),
+    ScanStatus.TILTED: (60, 185, 255),
+    ScanStatus.NO_CODE: (80, 215, 255),
+    ScanStatus.READY: (90, 255, 175),
+}
 
 
 def annotate_frame(
@@ -272,9 +758,35 @@ def annotate_frame(
     codes: Sequence[QRCode],
     *,
     show_hint: bool = True,
+    pose: Optional[PaperPose] = None,
+    analysis: Optional[FrameAnalysis] = None,
+    tilt_threshold: float = DEFAULT_TILT_THRESHOLD_DEG,
 ) -> np.ndarray:
-    """在图像副本上框出二维码，返回用于预览的 BGR 图像。"""
+    """在图像副本上框出图纸与二维码，返回用于预览的 BGR 图像。"""
     canvas = frame.copy()
+    if analysis is not None:
+        pose = analysis.pose
+        tilt_threshold = analysis.pose.tilt_threshold
+
+    # 图纸轮廓：水平为绿色，倾斜超标为橙色
+    if pose is not None and pose.found:
+        paper_ok = not pose.needs_correction
+        paper_color = (90, 255, 175) if paper_ok else (60, 185, 255)
+        points = np.array(pose.quad, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(canvas, [points], True, paper_color, 2, cv2.LINE_AA)
+        cv2.drawMarker(
+            canvas,
+            pose.center,
+            paper_color,
+            markerType=cv2.MARKER_CROSS,
+            markerSize=22,
+            thickness=2,
+        )
+        paper_label = f"PAPER {pose.angle_deg:+.1f} deg (limit {tilt_threshold:.1f})"
+        label_y = max(20, min(pose.quad, key=lambda point: point[1])[1] - 10)
+        _put_text(canvas, paper_label, (max(8, pose.rect[0] if pose.rect else 8), label_y), paper_color)
+
+    # 二维码框与内容
     for code in codes:
         x, y, width, height = code.rect
         if len(code.polygon) >= 4:
@@ -285,48 +797,22 @@ def annotate_frame(
 
         label = f"QR: {_ascii_label(code.data)}"
         label_y = max(24, y - 12)
-        cv2.putText(
-            canvas,
-            label,
-            (x, label_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 0, 0),
-            4,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            canvas,
-            label,
-            (x, label_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 170),
-            2,
-            cv2.LINE_AA,
-        )
+        _put_text(canvas, label, (x, label_y), (0, 255, 170), scale=0.7)
+
+    # 左上角综合状态
+    if analysis is not None:
+        status_color = _STATUS_COLORS[analysis.status]
+        _put_text(canvas, _STATUS_ASCII[analysis.status], (16, 34), status_color, scale=0.72)
+        if pose is not None and pose.found:
+            detail = f"tilt {pose.angle_deg:+.1f} / {tilt_threshold:.1f} deg   area {pose.area_ratio:.1%}"
+        else:
+            detail = "paper contour not found"
+        _put_text(canvas, detail, (16, 62), status_color, scale=0.55, thickness=1)
 
     if show_hint:
-        cv2.putText(
-            canvas,
-            "q / ESC: quit    s: snapshot",
-            (16, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 0, 0),
-            4,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            canvas,
-            "q / ESC: quit    s: snapshot",
-            (16, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (235, 245, 240),
-            1,
-            cv2.LINE_AA,
-        )
+        hint = "q / ESC: quit    s: snapshot"
+        height = int(canvas.shape[0])
+        _put_text(canvas, hint, (16, height - 16), (235, 245, 240), scale=0.6, thickness=1)
     return canvas
 
 
@@ -558,47 +1044,85 @@ def build_demo_frame(
     return frame
 
 
+def _grab_first_frame(capture: cv2.VideoCapture, timeout: float) -> Optional[np.ndarray]:
+    """在时间窗口内等待摄像头出图，用于设备探测与预热。"""
+    deadline = time.monotonic() + max(0.2, float(timeout))
+    while time.monotonic() < deadline:
+        ok, frame = capture.read()
+        if ok and frame is not None:
+            return frame
+        time.sleep(0.03)
+    return None
+
+
 def find_available_cameras(max_index: int = 5) -> List[Tuple[int, int, int]]:
-    """探测前 ``max_index`` 路摄像头，返回 ``[(index, width, height), ...]``。"""
+    """探测前 ``max_index`` 路摄像头，返回 ``[(index, width, height), ...]``。
+
+    Windows 摄像头打开后往往需要等待几百毫秒才出图，这里不再“读一次就判死”，
+    而是按后端回退并在 1.5 秒窗口内等待首帧。
+    """
     available: List[Tuple[int, int, int]] = []
+    backends = (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY) if IS_WINDOWS else (cv2.CAP_ANY,)
+
     for index in range(max_index + 1):
-        backend = cv2.CAP_DSHOW if IS_WINDOWS else cv2.CAP_ANY
-        capture = cv2.VideoCapture(index, backend)
-        if not capture.isOpened() and backend != cv2.CAP_ANY:
-            capture.release()
-            capture = cv2.VideoCapture(index)
-        try:
+        for backend in backends:
+            capture = cv2.VideoCapture(index, backend)
             if not capture.isOpened():
+                capture.release()
                 continue
-            ok, frame = capture.read()
-            if not ok or frame is None:
-                continue
-            height, width = frame.shape[:2]
-            available.append((index, width, height))
-        finally:
+
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            frame = _grab_first_frame(capture, 1.5)
             capture.release()
+            if frame is not None:
+                height, width = frame.shape[:2]
+                available.append((index, width, height))
+                break
     return available
 
 
-def _decode_image(image_path: Path) -> int:
+def _decode_image(
+    image_path: Path,
+    *,
+    tilt_threshold: float = DEFAULT_TILT_THRESHOLD_DEG,
+    min_paper_ratio: float = DEFAULT_MIN_PAPER_AREA_RATIO,
+    detect_pose: bool = True,
+) -> int:
     """离线识别单张图片，并把标注结果保存到 captures/。"""
     if not PYZBAR_AVAILABLE:
         LOGGER.error("pyzbar 不可用：%s", PYZBAR_IMPORT_ERROR)
         return 2
 
-    frame = cv2.imread(str(image_path))
+    frame = _imread_unicode(image_path)
     if frame is None:
         LOGGER.error("无法读取图片：%s", image_path)
         return 2
 
     scanner = CameraScanner()
-    codes = scanner.scan_frame(frame)
-    annotated = annotate_frame(frame, codes, show_hint=False)
+    analysis = scanner.analyze_frame(
+        frame,
+        tilt_threshold=tilt_threshold,
+        min_paper_area_ratio=min_paper_ratio,
+        detect_pose=detect_pose,
+    )
+    codes = list(analysis.codes)
+    annotated = annotate_frame(frame, codes, show_hint=False, analysis=analysis)
 
     CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
     output_path = CAPTURE_DIR / f"annotated_{image_path.stem}_{int(time.time())}.jpg"
-    cv2.imwrite(str(output_path), annotated)
+    if not _imwrite_unicode(output_path, annotated):
+        print(f"标注结果保存失败：{output_path}")
 
+    print(f"[STATUS] {analysis.status.value} | {analysis.message}")
+    if analysis.pose.found:
+        print(
+            f"[PAPER] angle={analysis.pose.angle_deg:+.1f} deg "
+            f"limit={tilt_threshold:.1f} area={analysis.pose.area_ratio:.1%} "
+            f"needs_correction={analysis.pose.needs_correction}"
+        )
+    else:
+        print("[PAPER] 未检测到图纸轮廓（仍会尝试识别画面中的二维码）")
     for code in codes:
         print(f"[QR] {code.data}  rect={code.rect}  center={code.center}")
     print(f"识别到 {len(codes)} 个二维码，标注结果已保存：{output_path}")
@@ -607,8 +1131,16 @@ def _decode_image(image_path: Path) -> int:
     return 0 if codes else 1
 
 
-def _preview(camera_index: int, width: int, height: int) -> int:
-    """打开摄像头实时预览并识别二维码。"""
+def _preview(
+    camera_index: int,
+    width: int,
+    height: int,
+    *,
+    tilt_threshold: float = DEFAULT_TILT_THRESHOLD_DEG,
+    min_paper_ratio: float = DEFAULT_MIN_PAPER_AREA_RATIO,
+    detect_pose: bool = True,
+) -> int:
+    """打开摄像头实时预览，叠加二维码与图纸倾斜角。"""
     scanner = CameraScanner(CameraConfig(index=camera_index, width=width, height=height))
     if not scanner.open():
         print(f"无法打开摄像头 {camera_index}。请检查连接或改用 --list-cameras 探测。")
@@ -616,30 +1148,62 @@ def _preview(camera_index: int, width: int, height: int) -> int:
     if not PYZBAR_AVAILABLE:
         LOGGER.warning("pyzbar 不可用（%s），仅显示摄像头画面", PYZBAR_IMPORT_ERROR)
 
-    window_name = "Alien Garden - Scanner Preview"
+    window_name = "Alien Garden - Scanner Preview (q/ESC)"
     last_seen: dict[str, float] = {}
+    last_status: Optional[ScanStatus] = None
+    last_status_log = 0.0
+    read_failures = 0
     try:
         while True:
             frame = scanner.read_frame()
             if frame is None:
-                break
+                read_failures += 1
+                if read_failures >= 30:
+                    LOGGER.error("连续读取失败，结束预览")
+                    break
+                time.sleep(0.1)
+                continue
+            read_failures = 0
 
-            codes = scanner.scan_frame(frame)
+            analysis = scanner.analyze_frame(
+                frame,
+                tilt_threshold=tilt_threshold,
+                min_paper_area_ratio=min_paper_ratio,
+                detect_pose=detect_pose,
+            )
             now = time.monotonic()
-            for code in codes:
+            for code in analysis.codes:
                 if now - last_seen.get(code.data, 0.0) > 2.0:
                     last_seen[code.data] = now
                     LOGGER.info("识别到二维码：%s（中心点 %s）", code.data, code.center)
 
-            cv2.imshow(window_name, annotate_frame(frame, codes))
+            if analysis.status is not last_status or now - last_status_log > 3.0:
+                if analysis.pose.found:
+                    LOGGER.info(
+                        "状态=%s 倾斜=%+.1f°（阈值 %.1f°）二维码=%s",
+                        analysis.status.value,
+                        analysis.pose.angle_deg,
+                        tilt_threshold,
+                        [code.data for code in analysis.codes],
+                    )
+                else:
+                    LOGGER.info(
+                        "状态=%s 未检测到图纸轮廓 二维码=%s",
+                        analysis.status.value,
+                        [code.data for code in analysis.codes],
+                    )
+                last_status = analysis.status
+                last_status_log = now
+
+            cv2.imshow(window_name, annotate_frame(frame, analysis.codes, analysis=analysis))
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
                 break
             if key == ord("s"):
                 CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
                 output_path = CAPTURE_DIR / f"snapshot_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
-                cv2.imwrite(str(output_path), frame)
-                LOGGER.info("快照已保存：%s", output_path)
+                if _imwrite_unicode(output_path, frame):
+                    LOGGER.info("快照已保存：%s", output_path)
     except KeyboardInterrupt:
         LOGGER.info("用户中断预览")
     finally:
@@ -648,7 +1212,14 @@ def _preview(camera_index: int, width: int, height: int) -> int:
     return 0
 
 
-def _demo(width: int, height: int) -> int:
+def _demo(
+    width: int,
+    height: int,
+    *,
+    tilt_threshold: float = DEFAULT_TILT_THRESHOLD_DEG,
+    min_paper_ratio: float = DEFAULT_MIN_PAPER_AREA_RATIO,
+    detect_pose: bool = True,
+) -> int:
     """无摄像头演示模式：动态生成模拟画纸并实时识别二维码。"""
     if not PYZBAR_AVAILABLE:
         LOGGER.warning("pyzbar 不可用（%s），演示画面会正常显示但不会识别", PYZBAR_IMPORT_ERROR)
@@ -662,23 +1233,28 @@ def _demo(width: int, height: int) -> int:
         while True:
             elapsed = time.monotonic() - started
             frame = build_demo_frame(width, height, elapsed)
-            codes = scanner.scan_frame(frame)
+            analysis = scanner.analyze_frame(
+                frame,
+                tilt_threshold=tilt_threshold,
+                min_paper_area_ratio=min_paper_ratio,
+                detect_pose=detect_pose,
+            )
 
             now = time.monotonic()
-            for code in codes:
+            for code in analysis.codes:
                 if now - last_seen.get(code.data, 0.0) > 2.0:
                     last_seen[code.data] = now
                     LOGGER.info("识别到演示二维码：%s（中心点 %s）", code.data, code.center)
 
-            cv2.imshow(window_name, annotate_frame(frame, codes))
+            cv2.imshow(window_name, annotate_frame(frame, analysis.codes, analysis=analysis))
             key = cv2.waitKey(33) & 0xFF
             if key in (27, ord("q")):
                 break
             if key == ord("s"):
                 CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
                 output_path = CAPTURE_DIR / f"demo_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
-                cv2.imwrite(str(output_path), frame)
-                LOGGER.info("演示快照已保存：%s", output_path)
+                if _imwrite_unicode(output_path, frame):
+                    LOGGER.info("演示快照已保存：%s", output_path)
     except KeyboardInterrupt:
         LOGGER.info("用户中断演示")
     finally:
@@ -687,7 +1263,146 @@ def _demo(width: int, height: int) -> int:
     return 0
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+def _imread_unicode(image_path: Path) -> Optional[np.ndarray]:
+    """读取图片，兼容 Windows 中文 / 非 ASCII 路径。"""
+    try:
+        data = np.fromfile(str(image_path), dtype=np.uint8)
+        if data.size == 0:
+            return None
+        return cv2.imdecode(data, cv2.IMREAD_COLOR)
+    except Exception as exc:
+        LOGGER.error("读取图片失败：%s（%s）", image_path, exc)
+        return None
+
+
+def _imwrite_unicode(output_path: Path, image: np.ndarray) -> bool:
+    """保存图片，兼容 Windows 中文 / 非 ASCII 路径。"""
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        suffix = output_path.suffix or ".jpg"
+        ok, buffer = cv2.imencode(suffix, image)
+        if not ok:
+            LOGGER.error("图片编码失败：%s", output_path)
+            return False
+        buffer.tofile(str(output_path))
+        return True
+    except Exception as exc:
+        LOGGER.error("保存图片失败：%s（%s）", output_path, exc)
+        return False
+
+
+def _probe(
+    camera_index: int,
+    width: int,
+    height: int,
+    *,
+    frames: int,
+    tilt_threshold: float = DEFAULT_TILT_THRESHOLD_DEG,
+    min_paper_ratio: float = DEFAULT_MIN_PAPER_AREA_RATIO,
+    detect_pose: bool = True,
+    as_json: bool = False,
+) -> int:
+    """无窗口抓取若干帧并输出分析摘要，便于在终端验证笔记本摄像头。"""
+    started = time.monotonic()
+    scanner = CameraScanner(
+        CameraConfig(index=camera_index, width=width, height=height, warmup_frames=6, open_timeout=2.5)
+    )
+    if not scanner.open():
+        message = scanner.last_error or f"无法打开摄像头 index={camera_index}"
+        if as_json:
+            print(json.dumps({"ok": False, "error": message}, ensure_ascii=False))
+        else:
+            print(f"PROBE_FAIL {message}")
+        return 1
+
+    status_counts = {status.value: 0 for status in ScanStatus}
+    captured = 0
+    angles: List[float] = []
+    last_frame: Optional[np.ndarray] = None
+    last_analysis: Optional[FrameAnalysis] = None
+    last_status: Optional[ScanStatus] = None
+    resolution = (0, 0)
+
+    try:
+        for index in range(max(1, int(frames))):
+            frame = scanner.read_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+
+            captured += 1
+            last_frame = frame
+            resolution = (frame.shape[1], frame.shape[0])
+            analysis = scanner.analyze_frame(
+                frame,
+                tilt_threshold=tilt_threshold,
+                min_paper_area_ratio=min_paper_ratio,
+                detect_pose=detect_pose,
+            )
+            last_analysis = analysis
+            status_counts[analysis.status.value] += 1
+            if analysis.pose.found:
+                angles.append(analysis.pose.angle_deg)
+
+            if not as_json and (last_status is None or analysis.status is not last_status):
+                tilt_text = f"{analysis.pose.angle_deg:+.1f}°" if analysis.pose.found else "n/a"
+                LOGGER.info(
+                    "frame %02d/%02d  status=%s  tilt=%s  qr=%s",
+                    index + 1,
+                    frames,
+                    analysis.status.value,
+                    tilt_text,
+                    [code.data for code in analysis.codes],
+                )
+            last_status = analysis.status
+            time.sleep(0.02)
+
+        snapshot: Optional[Path] = None
+        if last_frame is not None and last_analysis is not None:
+            output_path = CAPTURE_DIR / f"probe_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+            annotated = annotate_frame(
+                last_frame,
+                last_analysis.codes,
+                show_hint=False,
+                analysis=last_analysis,
+            )
+            if _imwrite_unicode(output_path, annotated):
+                snapshot = output_path
+    finally:
+        scanner.release()
+
+    elapsed = time.monotonic() - started
+    result: Dict[str, Any] = {
+        "ok": captured > 0,
+        "camera": camera_index,
+        "frames_requested": max(1, int(frames)),
+        "frames_captured": captured,
+        "resolution": list(resolution),
+        "status_counts": status_counts,
+        "tilt_range": [round(min(angles), 2), round(max(angles), 2)] if angles else [],
+        "last_qr": last_analysis.code_data if last_analysis else None,
+        "last_status": last_analysis.status.value if last_analysis else None,
+        "needs_correction": last_analysis.needs_correction if last_analysis else False,
+        "snapshot": str(snapshot) if snapshot is not None else None,
+        "elapsed_sec": round(elapsed, 2),
+    }
+
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        print(
+            "PROBE_OK "
+            f"frames={captured}/{frames} "
+            f"resolution={resolution[0]}x{resolution[1]} "
+            f"last_status={result['last_status']} "
+            f"tilt_range={result['tilt_range']} "
+            f"last_qr={result['last_qr']} "
+            f"elapsed={elapsed:.2f}s"
+        )
+        print(f"status_counts={status_counts}")
+        if snapshot is not None:
+            print(f"snapshot={snapshot}")
+    return 0 if captured > 0 else 1
     parser = argparse.ArgumentParser(description="外星花园 · 摄像头与二维码识别工具")
     parser.add_argument("--camera", type=int, default=0, help="摄像头序号（默认 0）")
     parser.add_argument("--width", type=int, default=1920, help="采集宽度（默认 1920）")
@@ -712,6 +1427,187 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _build_test_paper(rotation_deg: float, qr_text: str = "ALIEN-GARDEN-DEMO-001") -> np.ndarray:
+    """生成测试用“深色桌面 + 白纸 + 二维码”，可按指定角度旋转。"""
+    width, height = 960, 720
+    frame = np.full((height, width, 3), (24, 26, 28), dtype=np.uint8)
+
+    paper_width, paper_height = 560, 396
+    paper = np.full((paper_height, paper_width, 3), (242, 244, 238), dtype=np.uint8)
+    cv2.rectangle(paper, (3, 3), (paper_width - 4, paper_height - 4), (198, 204, 196), 2)
+    cv2.putText(
+        paper,
+        "MY ALIEN",
+        (36, paper_height - 34),
+        cv2.FONT_HERSHEY_SCRIPT_SIMPLEX,
+        1.2,
+        (120, 70, 45),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.circle(paper, (150, 170), 46, (66, 158, 92), 4, cv2.LINE_AA)
+    cv2.circle(paper, (134, 158), 6, (38, 45, 45), -1, cv2.LINE_AA)
+    cv2.circle(paper, (166, 158), 6, (38, 45, 45), -1, cv2.LINE_AA)
+
+    qr = _render_demo_qr(qr_text, 150)
+    qr_height, qr_width = qr.shape[:2]
+    paper[28 : 28 + qr_height, paper_width - qr_width - 28 : paper_width - 28] = qr
+
+    # 先在深色底板上旋转，避免旋转裁掉纸角
+    pad = 150
+    canvas = np.full(
+        (paper_height + 2 * pad, paper_width + 2 * pad, 3),
+        (22, 22, 20),
+        dtype=np.uint8,
+    )
+    canvas[pad : pad + paper_height, pad : pad + paper_width] = paper
+    center = (canvas.shape[1] / 2.0, canvas.shape[0] / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, rotation_deg, 1.0)
+    rotated = cv2.warpAffine(
+        canvas,
+        matrix,
+        (canvas.shape[1], canvas.shape[0]),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(22, 22, 20),
+    )
+
+    x = (width - rotated.shape[1]) // 2
+    y = (height - rotated.shape[0]) // 2
+    frame[y : y + rotated.shape[0], x : x + rotated.shape[1]] = rotated
+    return frame
+
+
+
+def _selftest() -> int:
+    """合成图算法自检：无需摄像头即可验证角度校准与联动状态。"""
+    failures: List[str] = []
+    scanner = CameraScanner()
+
+    # rotation_deg 使用 OpenCV 约定：正值逆时针，因此检测角为负
+    cases = (
+        (0.0, 0.0, False),
+        (-12.0, 12.0, True),
+        (12.0, -12.0, True),
+        (-3.0, 3.0, False),
+    )
+    for rotation, expected_angle, expected_correction in cases:
+        frame = _build_test_paper(rotation)
+        pose = detect_paper_pose(frame, tilt_threshold=8.0)
+        angle_error = abs(pose.angle_deg - expected_angle) if pose.found else float("inf")
+        passed = (
+            pose.found
+            and angle_error <= 3.0
+            and pose.needs_correction is expected_correction
+        )
+        print(
+            f"[POSE] rotation={rotation:+.1f} found={pose.found} "
+            f"angle={pose.angle_deg:+.1f} expected={expected_angle:+.1f} "
+            f"correction={pose.needs_correction} -> {'OK' if passed else 'FAIL'}"
+        )
+        if not passed:
+            failures.append(f"pose rotation={rotation:+.1f}")
+
+    blank = np.full((480, 640, 3), 18, dtype=np.uint8)
+    blank_pose = detect_paper_pose(blank, tilt_threshold=8.0)
+    if blank_pose.found:
+        failures.append("blank frame should not contain paper")
+    print(f"[POSE] blank found={blank_pose.found} -> {'OK' if not blank_pose.found else 'FAIL'}")
+
+    if PYZBAR_AVAILABLE:
+        level_frame = _build_test_paper(0.0)
+        level_analysis = scanner.analyze_frame(level_frame, tilt_threshold=8.0)
+        level_ok = level_analysis.ready and level_analysis.code_data == "ALIEN-GARDEN-DEMO-001"
+        print(
+            f"[LINK] level status={level_analysis.status.value} "
+            f"qr={level_analysis.code_data} -> {'OK' if level_ok else 'FAIL'}"
+        )
+        if not level_ok:
+            failures.append("level paper should be ready with QR")
+
+        tilted_analysis = scanner.analyze_frame(_build_test_paper(15.0), tilt_threshold=8.0)
+        tilted_ok = tilted_analysis.status is ScanStatus.TILTED and tilted_analysis.needs_correction
+        print(
+            f"[LINK] tilted status={tilted_analysis.status.value} "
+            f"qr={tilted_analysis.code_data} -> {'OK' if tilted_ok else 'FAIL'}"
+        )
+        if not tilted_ok:
+            failures.append("tilted paper must require correction")
+    else:
+        print(f"[LINK] pyzbar unavailable, skip QR checks: {PYZBAR_IMPORT_ERROR}")
+
+    if failures:
+        print(f"SELFTEST_FAIL {failures}")
+        return 1
+    print("SELFTEST_OK")
+    return 0
+
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="外星花园 · 摄像头识别与图纸姿态校准工具")
+    parser.add_argument("--camera", type=int, default=0, help="摄像头序号（默认 0）")
+    parser.add_argument("--width", type=int, default=1280, help="采集宽度（默认 1280）")
+    parser.add_argument("--height", type=int, default=720, help="采集高度（默认 720）")
+    parser.add_argument("--image", type=Path, default=None, help="离线识别指定图片")
+    parser.add_argument(
+        "--tilt-threshold",
+        type=float,
+        default=DEFAULT_TILT_THRESHOLD_DEG,
+        help=f"图纸允许倾斜角，单位度（默认 {DEFAULT_TILT_THRESHOLD_DEG:.0f}）",
+    )
+    parser.add_argument(
+        "--min-paper-ratio",
+        type=float,
+        default=DEFAULT_MIN_PAPER_AREA_RATIO,
+        help=f"图纸最小面积占比（默认 {DEFAULT_MIN_PAPER_AREA_RATIO:.2f}）",
+    )
+    parser.add_argument(
+        "--no-pose",
+        action="store_true",
+        help="关闭图纸轮廓校准，仅做二维码识别",
+    )
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="无窗口抓取摄像头画面，在终端输出识别与倾斜角摘要",
+    )
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=30,
+        help="--probe 抓取帧数（默认 30）",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="--probe 以 JSON 输出结果",
+    )
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="合成图算法自检（不需要摄像头）",
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="无摄像头演示模式：生成模拟画纸并实时识别二维码",
+    )
+    parser.add_argument(
+        "--list-cameras",
+        action="store_true",
+        help="探测 0~5 号摄像头并输出可用设备",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        help="日志级别（默认 INFO）",
+    )
+    return parser.parse_args(argv)
+
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(
@@ -720,12 +1616,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         datefmt="%H:%M:%S",
     )
 
+    detect_pose = not args.no_pose
+
+    if args.selftest:
+        return _selftest()
+
     if not PYZBAR_AVAILABLE:
         LOGGER.warning("pyzbar 初始化失败：%s", PYZBAR_IMPORT_ERROR)
         LOGGER.warning("摄像头预览仍可用，但二维码识别会返回空结果。")
 
     if args.demo:
-        return _demo(min(args.width, 1280), min(args.height, 720))
+        return _demo(
+            min(args.width, 1280),
+            min(args.height, 720),
+            tilt_threshold=args.tilt_threshold,
+            min_paper_ratio=args.min_paper_ratio,
+            detect_pose=detect_pose,
+        )
+
+    if args.probe:
+        return _probe(
+            args.camera,
+            args.width,
+            args.height,
+            frames=args.frames,
+            tilt_threshold=args.tilt_threshold,
+            min_paper_ratio=args.min_paper_ratio,
+            detect_pose=detect_pose,
+            as_json=args.json,
+        )
 
     if args.list_cameras:
         cameras = find_available_cameras()
@@ -740,9 +1659,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not args.image.is_file():
             print(f"图片不存在：{args.image}")
             return 2
-        return _decode_image(args.image)
+        return _decode_image(
+            args.image,
+            tilt_threshold=args.tilt_threshold,
+            min_paper_ratio=args.min_paper_ratio,
+            detect_pose=detect_pose,
+        )
 
-    return _preview(args.camera, args.width, args.height)
+    return _preview(
+        args.camera,
+        args.width,
+        args.height,
+        tilt_threshold=args.tilt_threshold,
+        min_paper_ratio=args.min_paper_ratio,
+        detect_pose=detect_pose,
+    )
 
 
 if __name__ == "__main__":

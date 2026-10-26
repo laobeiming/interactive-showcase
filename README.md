@@ -70,9 +70,40 @@ python main.py --windowed --video demo/standby_demo.avi  # 查看待机视频循
 ```
 - `--demo` 会生成“桌面上的手绘画纸 + 二维码”动态画面，**无需真实摄像头**；按 `q / ESC` 退出，按 `s` 截图。
 - `demo/` 目录用于本地演示素材，已加入 `.gitignore`，不会推送到仓库。
-- 当前阶段尚未接入实体按键与纸张姿态检测，硬件到货后可继续联调。
+- 实体按键触发与大屏视频切换待硬件到货后继续联调。
 
 ### 5. 说明
 - 二维码识别依赖 `pyzbar`；Windows 安装包内已带 `libzbar` DLL，若提示加载失败，请安装 Microsoft Visual C++ 运行库。
 - 待机视频默认静音，可用 `python main.py --volume 50` 调整。
 - 现场调试快照目录 `captures/` 已加入 `.gitignore`，不会误提交。
+
+---
+
+## ✅ 阶段二：视觉检测与大屏联动（已完成）
+
+### 1. 模块能力
+- **scanner.py**：摄像头打开 / 读取 / 释放（含热插拔与读帧重试）、pyzbar 二维码识别、基于轮廓检测的图纸水平倾斜角计算。
+  - `PaperPose`：输出 `angle_deg`（正数表示图纸右侧偏下）与 `correction_hint`（“请逆时针 / 顺时针旋转图纸约 X°”）；
+  - `ScanStatus`：`no_paper` / `tilted` / `no_code` / `ready`，只有 `ready` 允许上层触发联动；
+  - `CameraScanner.analyze_frame()` 一帧同时返回二维码与图纸姿态，主程序无需关心图像细节。
+- **main.py**：`VisionWorker` 后台线程按约 8 FPS 分析画面，`CameraCanvas` 实时预览并绘制图纸轮廓、倾斜角与二维码框；`ready` 连续稳定 3 帧且冷却 3 秒后才切换场景页，`tilted` 只在扫描页提示校正、不会误触发大屏。
+
+### 2. 启动联动
+```powershell
+python main.py --windowed --start-camera                # 窗口调试 + 摄像头扫描
+python main.py --start-camera                           # 全屏运行
+python main.py --start-camera --tilt-threshold 8 --min-paper-ratio 0.04
+python main.py --start-camera --camera 1 --width 1920 --height 1080
+```
+- 扫描页按 **C** 打开摄像头 / 返回待机；联动页按 **C** 立即返回扫描页。
+- 二维码内置主题关键字：`GARDEN / ALIEN`（外星花园）、`OCEAN / SEA / AQUA`（深海星潮）、`FOREST / TREE`（荧光森林）、`DESERT / SAND`（赤砂星球）；未知 ID 使用稳定兜底主题。
+
+### 3. 终端自检与测试（无需界面）
+```powershell
+python scanner.py --selftest                            # 合成图纸：角度 + 二维码 + 联动状态
+python test_vision.py --demo --no-window --frames 30    # 无摄像头端到端联调
+python test_vision.py --no-window --frames 60           # 真实摄像头逐帧联调
+python -m unittest discover -s tests -v                 # 单元测试
+```
+- `test_vision.py` 会用 pyzbar 直接解码与 `scanner` 结果交叉校验；退出码 0 表示必需项全部通过。
+- 真实摄像头联调时，若画面中没有图纸 / 二维码，识别项仅给出提示（INFO），仍会验证出帧与算法执行链路。
