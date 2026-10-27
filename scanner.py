@@ -3,7 +3,9 @@
 本模块负责“看得见、读得出、摆得正”：
 * 封装 OpenCV 摄像头的打开、读取、释放与热插拔容错；
 * 封装 pyzbar 二维码识别，输出二维码内容、位置与中心点；
-* 基于轮廓检测估算图纸摆放的水平倾斜角，倾斜超标时输出校正信号；
+* 基于轮廓 + ``cv2.minAreaRect`` 旋转外接矩形估算图纸摆放角度，
+  倾斜超标时输出校正信号；
+* 在预览画面上绘制贴合纸张倾斜的旋转线框，并用中文提示“请摆正图画 / 已摆正”；
 * 提供独立命令行预览 / 终端探测 / 算法自检工具，便于现场调试高拍仪。
 
 上层（``main.py``）通过 ``CameraScanner.analyze_frame()`` 一次性获得
@@ -32,6 +34,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -44,11 +47,14 @@ PROJECT_DIR = Path(__file__).resolve().parent
 CAPTURE_DIR = PROJECT_DIR / "captures"
 
 Point = Tuple[int, int]
+FloatPoint = Tuple[float, float]
+Size = Tuple[float, float]
+RotatedRect = Tuple[FloatPoint, Size, float]
 Quad = Tuple[Point, Point, Point, Point]
 Rect = Tuple[int, int, int, int]
 
 # 图纸水平角阈值：|倾斜角| 超过该值即认为需要校正摆放
-DEFAULT_TILT_THRESHOLD_DEG = 8.0
+DEFAULT_TILT_THRESHOLD_DEG = 5.0
 # 图纸至少占画面面积的比例，过滤桌面纹理、二维码小方块等误检
 DEFAULT_MIN_PAPER_AREA_RATIO = 0.04
 # 图纸最多占画面面积的比例，避免把整幅画面边框当成图纸
@@ -67,6 +73,28 @@ except Exception as exc:  # ImportError 或 OSError（DLL 缺失）
     ZBarSymbol = None  # type: ignore[assignment]
     PYZBAR_AVAILABLE = False
     PYZBAR_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+# OpenCV 的 putText 不支持中文，预览画面的中文提示改用 Pillow 渲染。
+# Pillow 缺失时自动退回英文提示，不影响识别主流程。
+try:
+    from PIL import Image, ImageDraw, ImageFont
+
+    PIL_AVAILABLE = True
+    PIL_IMPORT_ERROR = ""
+except Exception as exc:  # ImportError 或 DLL 缺失
+    Image = ImageDraw = ImageFont = None  # type: ignore[assignment]
+    PIL_AVAILABLE = False
+    PIL_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+CJK_FONT_CANDIDATES = (
+    r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\msyhbd.ttc",
+    r"C:\Windows\Fonts\simhei.ttf",
+    r"C:\Windows\Fonts\simsun.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/System/Library/Fonts/PingFang.ttc",
+)
 
 
 @dataclass(frozen=True)
@@ -94,12 +122,15 @@ class QRCode:
 
 @dataclass(frozen=True)
 class PaperPose:
-    """图纸摆放姿态（基于轮廓检测估算）。
+    """图纸摆放姿态（基于 ``cv2.minAreaRect`` 旋转外接矩形估算）。
 
-    ``angle_deg`` 为图纸上边缘相对水平线的倾角，范围约 ``[-45, 45]``：
+    ``angle_deg`` 为图纸长边相对水平线的真实夹角，范围约 ``[-45, 45]``：
 
-    * 正数：图纸右侧偏下，需要**逆时针**回正；
-    * 负数：图纸右侧偏上，需要**顺时针**回正。
+    * 正数：图纸右侧偏下（屏幕顺时针倾斜），需要**逆时针**回正；
+    * 负数：图纸右侧偏上（屏幕逆时针倾斜），需要**顺时针**回正。
+
+    ``rect_center`` / ``rect_size`` / ``rect_angle_deg`` 直接来自旋转外接矩形，
+    其中 ``rect_size`` 已按长宽关系交换，第一项为长边、第二项为短边。
     """
 
     found: bool
@@ -110,9 +141,14 @@ class PaperPose:
     confidence: float = 0.0
     tilt_threshold: float = DEFAULT_TILT_THRESHOLD_DEG
     needs_correction: bool = False
+    rect_center: Optional[FloatPoint] = None
+    rect_size: Size = (0.0, 0.0)
+    rect_angle_deg: float = 0.0
 
     @property
     def center(self) -> Point:
+        if self.rect_center is not None:
+            return (int(round(self.rect_center[0])), int(round(self.rect_center[1])))
         if self.rect is None:
             return (0, 0)
         x, y, width, height = self.rect
@@ -123,6 +159,11 @@ class PaperPose:
         return abs(self.angle_deg)
 
     @property
+    def is_straight(self) -> bool:
+        """图纸是否在允许角度内（未检测到图纸时视为未摆正）。"""
+        return bool(self.found and not self.needs_correction)
+
+    @property
     def correction_hint(self) -> str:
         """给操作者看的回正方向提示（未超标时为空字符串）。"""
         if not self.found or not self.needs_correction:
@@ -130,15 +171,32 @@ class PaperPose:
         direction = "逆时针" if self.angle_deg > 0 else "顺时针"
         return f"请{direction}旋转图纸约 {self.abs_angle:.1f}°"
 
+    @property
+    def status_label(self) -> str:
+        """预览画面使用的中文状态文案。"""
+        if not self.found:
+            return "未检测到图纸"
+        if self.needs_correction:
+            return f"请摆正图画（偏离 {self.abs_angle:.1f}°）"
+        return "已摆正"
+
     def to_dict(self) -> dict:
         return {
             "found": self.found,
+            "is_straight": self.is_straight,
             "angle_deg": round(self.angle_deg, 2),
             "needs_correction": self.needs_correction,
             "tilt_threshold": self.tilt_threshold,
             "quad": [list(point) for point in self.quad] if self.found else [],
             "rect": self.rect,
             "center": self.center,
+            "rect_center": (
+                [round(self.rect_center[0], 2), round(self.rect_center[1], 2)]
+                if self.rect_center is not None
+                else None
+            ),
+            "rect_size": [round(value, 2) for value in self.rect_size],
+            "rect_angle_deg": round(self.rect_angle_deg, 2),
             "area_ratio": round(self.area_ratio, 4),
             "confidence": round(self.confidence, 4),
         }
@@ -201,12 +259,48 @@ class FrameAnalysis:
     def ready(self) -> bool:
         return self.status is ScanStatus.READY
 
+    @property
+    def is_straight(self) -> bool:
+        """图纸是否已摆正（用于 ``main.py`` 判定是否允许拍照触发）。"""
+        return self.pose.is_straight
+
+    @property
+    def angle(self) -> float:
+        """图纸相对水平线的真实夹角（度）。"""
+        return float(self.pose.angle_deg)
+
+    @property
+    def code_id(self) -> str:
+        """当前主二维码 ID；未识别时为空字符串。"""
+        return self.code_data or ""
+
+    @property
+    def alignment(self) -> Dict[str, Any]:
+        """供上层直接判定的精简结果：``(is_straight, angle, code_id)``。"""
+        return self.to_alignment()
+
+    def to_alignment(self) -> Dict[str, Any]:
+        return {
+            "is_straight": self.is_straight,
+            "angle": round(self.angle, 2),
+            "code_id": self.code_id,
+        }
+
+    def __iter__(self):
+        """支持 ``is_straight, angle, code_id = analysis`` 解包。"""
+        yield self.is_straight
+        yield self.angle
+        yield self.code_id
+
     def to_dict(self) -> dict:
         return {
             "status": self.status.value,
             "message": self.message,
             "codes": [code.to_dict() for code in self.codes],
             "pose": self.pose.to_dict(),
+            "is_straight": self.is_straight,
+            "angle": round(self.angle, 2),
+            "code_id": self.code_id,
             "frame_size": list(self.frame_size),
             "timestamp": round(self.timestamp, 3),
         }
@@ -372,6 +466,7 @@ class CameraScanner:
         return replace(
             pose,
             angle_deg=smoothed,
+            rect_angle_deg=smoothed,
             needs_correction=abs(smoothed) > float(pose.tilt_threshold),
         )
 
@@ -511,6 +606,29 @@ class CameraScanner:
             timestamp=time.time(),
         )
 
+    def detect_alignment(
+        self,
+        frame: np.ndarray,
+        *,
+        roi: Optional[Rect] = None,
+        tilt_threshold: float = DEFAULT_TILT_THRESHOLD_DEG,
+        min_paper_area_ratio: float = DEFAULT_MIN_PAPER_AREA_RATIO,
+        detect_pose: bool = True,
+    ) -> Dict[str, Any]:
+        """识别一帧并返回精简字典：``{is_straight, angle, code_id}``。
+
+        该接口直接面向 ``main.py`` 的拍照触发判定：
+        只有 ``is_straight`` 为 True 且 ``code_id`` 非空时才允许触发。
+        """
+        analysis = self.analyze_frame(
+            frame,
+            roi=roi,
+            tilt_threshold=tilt_threshold,
+            min_paper_area_ratio=min_paper_area_ratio,
+            detect_pose=detect_pose,
+        )
+        return analysis.to_alignment()
+
     def scan_once(self, roi: Optional[Rect] = None) -> Tuple[Optional[np.ndarray], List[QRCode]]:
         """抓取一帧并立即识别，返回 ``(frame, codes)``。"""
         frame = self.read_frame()
@@ -567,25 +685,6 @@ def _order_quad(points: np.ndarray) -> Quad:
     )
 
 
-def _quad_tilt_deg(quad: Quad) -> float:
-    """按四条边的加权平均，计算图纸相对水平线的倾斜角。"""
-    tl, tr, br, bl = (np.array(point, dtype=np.float64) for point in quad)
-    edges = ((tl, tr), (bl, br), (tl, bl), (tr, br))
-    total = 0.0
-    weight_sum = 0.0
-    for start, end in edges:
-        delta = end - start
-        length = float(np.hypot(delta[0], delta[1]))
-        if length < 8.0:  # 太短的边受噪声影响大，直接忽略
-            continue
-        raw_angle = math.degrees(math.atan2(float(delta[1]), float(delta[0])))
-        total += _normalize_angle(raw_angle) * length
-        weight_sum += length
-    if weight_sum <= 0.0:
-        return 0.0
-    return _normalize_angle(total / weight_sum)
-
-
 def _quad_corner_angles(quad: Quad) -> List[float]:
     """返回四边形的四个内角（度），用于剔除三角形、细长条等伪四边形。"""
     points = np.asarray(quad, dtype=np.float64)
@@ -637,23 +736,33 @@ def _anchor_inside(
     return True
 
 
-def _quad_from_contour(
-    contour: np.ndarray,
-    box: np.ndarray,
-) -> Tuple[Quad, float]:
-    """优先用 approxPolyDP 贴合真实纸张边界，失败时退回最小外接矩形。"""
-    perimeter = cv2.arcLength(contour, True)
-    if perimeter > 0:
-        for ratio in (0.02, 0.03, 0.045, 0.06):
-            approx = cv2.approxPolyDP(contour, ratio * perimeter, True)
-            if len(approx) == 4 and cv2.isContourConvex(approx):
-                quad = _order_quad(approx.reshape(-1, 2))
-                quad_area = abs(
-                    float(cv2.contourArea(np.asarray(quad, dtype=np.float32)))
-                )
-                if quad_area > 0:
-                    return quad, quad_area
+def _rect_tilt_deg(rect: RotatedRect) -> Tuple[float, Size]:
+    """把 ``cv2.minAreaRect`` 的 ``(center, size, angle)`` 标准化为水平夹角。
 
+    OpenCV 4.x 返回的 ``angle`` 位于 ``(-90, 0]``，且 ``size`` 的长短边顺序
+    会随纸张旋转方向变化。这里按长宽关系统一为“长边在水平方向”，再把角度
+    归一化到 ``[-45, 45]``：
+
+    * 宽度小于高度时交换长宽，并把角度加 90°；
+    * 正数表示图纸右侧偏下（屏幕顺时针倾斜），负数相反。
+
+    Returns:
+        ``(angle_deg, (long_edge, short_edge))``。
+    """
+    _center, (width, height), angle = rect
+    width = float(width)
+    height = float(height)
+    angle = float(angle)
+
+    if width < height:
+        width, height = height, width
+        angle += 90.0
+
+    return _normalize_angle(angle), (width, height)
+
+
+def _quad_from_box(box: np.ndarray) -> Tuple[Quad, float]:
+    """用旋转外接矩形的四个角点生成贴合纸张倾斜的四边形。"""
     quad = _order_quad(box)
     quad_area = abs(float(cv2.contourArea(box.astype(np.float32))))
     return quad, quad_area
@@ -729,18 +838,19 @@ def detect_paper_pose(
     anchor_polygon: Optional[Sequence[Point]] = None,
     anchor_rect: Optional[Rect] = None,
 ) -> PaperPose:
-    """基于轮廓检测估算图纸摆放的水平角。
+    """基于旋转外接矩形估算图纸摆放的水平角。
 
     处理流程：
     1. 灰度化 + 高斯模糊，生成 Canny 边缘掩膜与 Otsu 亮区掩膜；
-    2. ``findContours`` 提取外轮廓，用 ``approxPolyDP`` / ``minAreaRect`` 拟合四边形；
+    2. ``findContours`` 提取外轮廓，用 ``cv2.minAreaRect`` 获取旋转外接矩形；
     3. 按面积、矩形度、长宽比、凸性、四角角度、白纸外观筛选候选；
     4. 有二维码时要求二维码落在纸张内部（锚定），彻底排除天花板、窗户等大亮块；
-    5. 由四条边角度加权平均得到倾斜角，超过阈值时 ``needs_correction=True``。
+    5. 用 ``cv2.boxPoints`` 生成贴合倾斜的四边形，并按长宽关系标准化矩形角度，
+       超过阈值时 ``needs_correction=True``。
 
     Args:
         frame: OpenCV BGR / 灰度图像。
-        tilt_threshold: 允许的最大倾斜角（度），默认 8°。
+        tilt_threshold: 允许的最大倾斜角（度），默认 5°。
         min_area_ratio: 图纸最小面积占比。
         max_area_ratio: 图纸最大面积占比。
         hint_point: 二维码中心点。提供时只接受包含该点的候选，用于锚定真实纸张。
@@ -765,6 +875,7 @@ def detect_paper_pose(
     edges, bright = _paper_masks(gray)
 
     best_quad: Optional[Quad] = None
+    best_rect_fit: Optional[RotatedRect] = None
     best_area_ratio = 0.0
     best_confidence = 0.0
     best_score = -1.0
@@ -803,7 +914,7 @@ def detect_paper_pose(
                 continue
 
             try:
-                quad, quad_area = _quad_from_contour(contour, box)
+                quad, quad_area = _quad_from_box(box)
             except (ValueError, cv2.error):
                 continue
             if quad_area <= 0.0 or quad_area / frame_area > max_area_ratio:
@@ -876,13 +987,20 @@ def detect_paper_pose(
             if score > best_score:
                 best_score = score
                 best_quad = quad
+                best_rect_fit = rect_fit
                 best_area_ratio = quad_area / frame_area
                 best_confidence = min(1.0, 0.35 + 0.65 * appearance)
 
-    if best_quad is None:
+    if best_quad is None or best_rect_fit is None:
         return PaperPose(found=False, tilt_threshold=tilt_threshold)
 
-    tilt_deg = _quad_tilt_deg(best_quad)
+    # 旋转外接矩形是角度的唯一来源：按长宽关系标准化后得到真实偏离角
+    tilt_deg, rect_size = _rect_tilt_deg(best_rect_fit)
+    rect_center = (
+        round(float(best_rect_fit[0][0]), 2),
+        round(float(best_rect_fit[0][1]), 2),
+    )
+
     xs = [point[0] for point in best_quad]
     ys = [point[1] for point in best_quad]
     x0 = max(0, min(xs))
@@ -900,6 +1018,27 @@ def detect_paper_pose(
         confidence=best_confidence,
         tilt_threshold=tilt_threshold,
         needs_correction=abs(tilt_deg) > float(tilt_threshold),
+        rect_center=rect_center,
+        rect_size=rect_size,
+        rect_angle_deg=tilt_deg,
+    )
+
+
+def detect_paper_alignment(
+    frame: np.ndarray,
+    *,
+    tilt_threshold: float = DEFAULT_TILT_THRESHOLD_DEG,
+    min_paper_area_ratio: float = DEFAULT_MIN_PAPER_AREA_RATIO,
+) -> Dict[str, Any]:
+    """单帧识别入口：返回 ``{is_straight, angle, code_id}``。
+
+    便捷函数，内部创建一个临时 ``CameraScanner``（不打开摄像头），
+    与 ``CameraScanner.detect_alignment`` 结果一致。
+    """
+    return CameraScanner().detect_alignment(
+        frame,
+        tilt_threshold=tilt_threshold,
+        min_paper_area_ratio=min_paper_area_ratio,
     )
 
 
@@ -941,6 +1080,112 @@ def _put_text(
     )
 
 
+@lru_cache(maxsize=16)
+def _load_cjk_font(font_size: int) -> Any:
+    """加载可显示中文的字体；找不到时返回 None。"""
+    if not PIL_AVAILABLE or ImageFont is None:
+        return None
+    for candidate in CJK_FONT_CANDIDATES:
+        font_path = Path(candidate)
+        if not font_path.is_file():
+            continue
+        try:
+            return ImageFont.truetype(str(font_path), font_size)
+        except Exception:  # 字体损坏或格式不支持时继续尝试下一个
+            continue
+    return None
+
+
+@lru_cache(maxsize=64)
+def _render_cjk_rgba(
+    text: str,
+    color: Tuple[int, int, int],
+    font_size: int,
+    stroke_width: int,
+) -> Optional[np.ndarray]:
+    """把中文文本渲染成 RGBA 数组；Pillow / 字体不可用时返回 None。"""
+    font = _load_cjk_font(font_size)
+    if font is None or Image is None or ImageDraw is None:
+        return None
+
+    # color 为 OpenCV BGR，Pillow 使用 RGB
+    fill = (int(color[2]), int(color[1]), int(color[0]), 255)
+    probe = Image.new("RGBA", (4, 4), (0, 0, 0, 0))
+    probe_draw = ImageDraw.Draw(probe)
+    bbox = probe_draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+    padding = max(2, stroke_width + 2)
+    width = max(1, int(bbox[2] - bbox[0]) + padding * 2)
+    height = max(1, int(bbox[3] - bbox[1]) + padding * 2)
+
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.text(
+        (padding - bbox[0], padding - bbox[1]),
+        text,
+        font=font,
+        fill=fill,
+        stroke_width=stroke_width,
+        stroke_fill=(0, 0, 0, 255),
+    )
+    return np.asarray(image, dtype=np.uint8).copy()
+
+
+def _put_cjk_text(
+    canvas: np.ndarray,
+    text: str,
+    position: Point,
+    color: Tuple[int, int, int],
+    *,
+    scale: float = 0.75,
+    thickness: int = 2,
+    fallback: Optional[str] = None,
+    backdrop: bool = False,
+) -> bool:
+    """在 BGR 画面上绘制中文（带黑色描边），返回是否成功。
+
+    ``backdrop=True`` 时先压暗文字区域，避免复杂画纸背景影响可读性。
+    Pillow 或中文字体不可用时自动退回 ``_put_text`` 的英文提示，
+    保证无额外依赖的调试环境仍能正常预览。
+    """
+    font_size = max(14, int(round(26.0 * scale)))
+    stroke_width = max(1, int(thickness))
+    rgba = _render_cjk_rgba(text, color, font_size, stroke_width)
+    if rgba is None:
+        _put_text(
+            canvas,
+            fallback or _ascii_label(text),
+            position,
+            color,
+            scale=scale,
+            thickness=thickness,
+        )
+        return False
+
+    x, y = int(position[0]), int(position[1])
+    canvas_height, canvas_width = canvas.shape[:2]
+    patch_height, patch_width = rgba.shape[:2]
+
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(canvas_width, x + patch_width)
+    y1 = min(canvas_height, y + patch_height)
+    if x1 <= x0 or y1 <= y0:
+        return False
+
+    patch = rgba[y0 - y : y1 - y, x0 - x : x1 - x]
+    alpha = patch[..., 3:4].astype(np.float32) / 255.0
+    bgr = patch[..., :3][:, :, ::-1].astype(np.float32)
+    region = canvas[y0:y1, x0:x1].astype(np.float32)
+    if backdrop:
+        region *= 0.35
+    canvas[y0:y1, x0:x1] = np.clip(
+        region * (1.0 - alpha) + bgr * alpha,
+        0,
+        255,
+    ).astype(np.uint8)
+    return True
+
+
 _STATUS_ASCII = {
     ScanStatus.NO_PAPER: "STATUS: NO PAPER",
     ScanStatus.TILTED: "STATUS: TILTED - LEVEL THE PAPER",
@@ -950,9 +1195,9 @@ _STATUS_ASCII = {
 
 _STATUS_COLORS = {
     ScanStatus.NO_PAPER: (205, 205, 205),
-    ScanStatus.TILTED: (60, 185, 255),
+    ScanStatus.TILTED: (50, 70, 255),
     ScanStatus.NO_CODE: (80, 215, 255),
-    ScanStatus.READY: (90, 255, 175),
+    ScanStatus.READY: (80, 230, 120),
 }
 
 
@@ -971,12 +1216,12 @@ def annotate_frame(
         pose = analysis.pose
         tilt_threshold = analysis.pose.tilt_threshold
 
-    # 图纸轮廓：水平为绿色，倾斜超标为橙色
+    # 图纸轮廓：使用旋转外接矩形的四个角点，已摆正为绿色、倾斜超标为红色
     if pose is not None and pose.found:
-        paper_ok = not pose.needs_correction
-        paper_color = (90, 255, 175) if paper_ok else (60, 185, 255)
+        paper_ok = pose.is_straight
+        paper_color = (80, 230, 120) if paper_ok else (50, 70, 255)
         points = np.array(pose.quad, dtype=np.int32).reshape(-1, 1, 2)
-        cv2.polylines(canvas, [points], True, paper_color, 2, cv2.LINE_AA)
+        cv2.drawContours(canvas, [points], -1, paper_color, 3, cv2.LINE_AA)
         cv2.drawMarker(
             canvas,
             pose.center,
@@ -985,9 +1230,29 @@ def annotate_frame(
             markerSize=22,
             thickness=2,
         )
-        paper_label = f"PAPER {pose.angle_deg:+.1f} deg (limit {tilt_threshold:.1f})"
-        label_y = max(20, min(pose.quad, key=lambda point: point[1])[1] - 10)
-        _put_text(canvas, paper_label, (max(8, pose.rect[0] if pose.rect else 8), label_y), paper_color)
+
+        # 中文状态提示：贴近纸张左上角，倾斜时明确给出偏离角度
+        fallback_label = (
+            "PAPER STRAIGHT"
+            if paper_ok
+            else f"LEVEL PAPER (OFF {pose.abs_angle:.1f} DEG)"
+        )
+        top_left = min(pose.quad, key=lambda point: point[0] + point[1])
+        canvas_height, canvas_width = canvas.shape[:2]
+        label_x = max(8, min(canvas_width - 320, int(top_left[0])))
+        # 下方状态 HUD 占用了 y≈60 区域，这里至少下移，避免文字互相遮挡
+        label_y = max(92, int(top_left[1]) - 42)
+        label_y = min(max(8, canvas_height - 80), label_y)
+        _put_cjk_text(
+            canvas,
+            pose.status_label,
+            (label_x, label_y),
+            paper_color,
+            scale=0.9,
+            thickness=2,
+            fallback=fallback_label,
+            backdrop=True,
+        )
 
     # 二维码框与内容
     for code in codes:

@@ -8,6 +8,7 @@
 - **核心语言**：Python 3.10+
 - **计算机视觉**：OpenCV (图像边缘计算、角度矫正、高拍仪推流)
 - **解码组件**：PyZbar (二维码秒级解码匹配)
+- **中文标注**：Pillow (OpenCV 预览画面渲染中文提示)
 - **界面交互**：PyQt5 (多媒体全屏展示、无缝视频切换)
 - **硬件集成**：USB 外部触发按键监听、Windows 开机自启服务
 
@@ -17,7 +18,7 @@
 1. **待机常驻**：系统启动后全屏无缝循环播放待机背景视频。
 2. **图纸扫描与姿态校准**：
    - 高拍仪实时捕捉观众手绘画作。
-   - 算法识别图纸二维码 ID，并通过轮廓检测判断图纸水平摆放角度（误差超过阈值时给出摆正提示）。
+   - 算法识别图纸二维码 ID，并通过 `cv2.minAreaRect` 旋转外接矩形判断图纸水平摆放角度（超过阈值时给出摆正提示）。
 3. **实体按键触发**：监听展台外部 USB 大按键信号，收到触发后将画作高清抓拍并投射至大屏。
 4. **场景联动**：根据二维码关联的画作主题，平滑切入对应的外星生物交互特效视频。
 
@@ -86,10 +87,11 @@ python main.py --windowed --video demo/standby_demo.avi --no-camera  # 待机视
 ## ✅ 阶段二：视觉检测与大屏联动（已完成）
 
 ### 1. 模块能力
-- **scanner.py**：摄像头打开 / 读取 / 释放（含热插拔与读帧重试）、pyzbar 二维码识别、基于轮廓检测的图纸水平倾斜角计算。
-  - `PaperPose`：输出 `angle_deg`（正数表示图纸右侧偏下）与 `correction_hint`（“请逆时针 / 顺时针旋转图纸约 X°”）；
+- **scanner.py**：摄像头打开 / 读取 / 释放（含热插拔与读帧重试）、pyzbar 二维码识别、基于 `cv2.minAreaRect` 旋转外接矩形的图纸摆放角度检测。
+  - `PaperPose`：输出中心点 `rect_center`、长宽 `rect_size`、标准化后的真实夹角 `angle_deg`（正数表示图纸右侧偏下），以及 `correction_hint`（“请逆时针 / 顺时针旋转图纸约 X°”）；
+  - 预览画面用 `cv2.boxPoints()` + `cv2.drawContours()` 绘制贴合纸张倾斜的旋转线框：超过阈值（默认 ±5°）为红色并标注“请摆正图画（偏离 X°）”，阈值内为绿色并标注“已摆正”；
   - `ScanStatus`：`no_paper` / `tilted` / `no_code` / `ready`，只有 `ready` 允许上层触发联动；
-  - `CameraScanner.analyze_frame()` 一帧同时返回二维码与图纸姿态，主程序无需关心图像细节。
+  - `CameraScanner.analyze_frame()` 一帧同时返回二维码与图纸姿态；`analyze_frame(...).to_alignment()` 或 `detect_paper_alignment(frame)` 直接返回 `{is_straight, angle, code_id}`，主程序无需关心图像细节。
 - **main.py**：`VisionWorker` 后台线程按约 8 FPS 分析画面，`CameraCanvas` 实时预览并绘制图纸轮廓、倾斜角与二维码框；`ready` 连续稳定 3 帧且冷却 3 秒后才切换场景页，`tilted` 只在扫描页提示校正、不会误触发大屏。
 
 ### 2. 启动联动
@@ -97,7 +99,7 @@ python main.py --windowed --video demo/standby_demo.avi --no-camera  # 待机视
 python main.py                 # 全屏运行 + 摄像头扫描（默认行为）
 python main.py --windowed      # 窗口调试 + 摄像头扫描
 python main.py --no-camera     # 禁用摄像头，仅待机展示
-python main.py --tilt-threshold 8 --min-paper-ratio 0.04
+python main.py --tilt-threshold 5 --min-paper-ratio 0.04
 python main.py --camera 1 --width 1920 --height 1080
 ```
 - 扫描页按 **C** 关闭摄像头 / 返回待机；联动页按 **C** 立即返回扫描页。

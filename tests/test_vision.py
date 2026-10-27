@@ -71,6 +71,80 @@ class PaperPoseTests(unittest.TestCase):
         self.assertFalse(pose.needs_correction)
 
 
+class AlignmentPayloadTests(unittest.TestCase):
+    """旋转外接矩形角度标准化与对外精简结果测试。"""
+
+    def test_alignment_payload_and_tuple_unpack(self) -> None:
+        frame = scanner._build_test_paper(-12.0)
+        analysis = scanner.CameraScanner().analyze_frame(frame, tilt_threshold=5.0)
+
+        payload = analysis.to_alignment()
+        self.assertEqual(set(payload), {"is_straight", "angle", "code_id"})
+        self.assertFalse(payload["is_straight"])
+        self.assertAlmostEqual(payload["angle"], 12.0, delta=2.0)
+        self.assertEqual(payload["code_id"], "ALIEN-GARDEN-DEMO-001")
+
+        is_straight, angle, code_id = analysis
+        self.assertFalse(is_straight)
+        self.assertAlmostEqual(angle, 12.0, delta=2.0)
+        self.assertEqual(code_id, "ALIEN-GARDEN-DEMO-001")
+
+        self.assertFalse(analysis.is_straight)
+        self.assertTrue(analysis.pose.needs_correction)
+        self.assertIn("请摆正图画", analysis.pose.status_label)
+
+    def test_min_area_rect_metadata(self) -> None:
+        frame = scanner._build_test_paper(0.0)
+        pose = scanner.detect_paper_pose(frame, tilt_threshold=5.0)
+
+        self.assertTrue(pose.found)
+        self.assertIsNotNone(pose.rect_center)
+        self.assertGreater(pose.rect_size[0], pose.rect_size[1])
+        self.assertEqual(len(pose.quad), 4)
+        self.assertAlmostEqual(pose.angle_deg, 0.0, delta=2.0)
+        self.assertTrue(pose.is_straight)
+
+    def test_small_angle_is_straight_with_default_threshold(self) -> None:
+        frame = scanner._build_test_paper(3.0)
+        analysis = scanner.CameraScanner().analyze_frame(frame)
+
+        self.assertTrue(analysis.is_straight)
+        self.assertEqual(analysis.status, scanner.ScanStatus.READY)
+        self.assertEqual(analysis.pose.status_label, "已摆正")
+        self.assertLessEqual(abs(analysis.angle), scanner.DEFAULT_TILT_THRESHOLD_DEG)
+
+    def test_detect_paper_alignment_function(self) -> None:
+        payload = scanner.detect_paper_alignment(
+            scanner._build_test_paper(10.0),
+            tilt_threshold=5.0,
+        )
+        self.assertFalse(payload["is_straight"])
+        self.assertAlmostEqual(payload["angle"], -10.0, delta=2.0)
+        self.assertEqual(payload["code_id"], "ALIEN-GARDEN-DEMO-001")
+
+    def test_annotate_frame_draws_rotated_box_and_cjk_label(self) -> None:
+        import numpy as np
+
+        frame = scanner._build_test_paper(-12.0)
+        analysis = scanner.CameraScanner().analyze_frame(frame, tilt_threshold=5.0)
+        annotated = scanner.annotate_frame(frame, analysis.codes, analysis=analysis)
+
+        self.assertEqual(annotated.shape, frame.shape)
+        self.assertFalse(np.array_equal(annotated, frame))
+        if scanner.PIL_AVAILABLE:
+            canvas = np.full((80, 360, 3), 24, dtype=np.uint8)
+            drawn = scanner._put_cjk_text(
+                canvas,
+                analysis.pose.status_label,
+                (10, 10),
+                (50, 70, 255),
+                scale=0.9,
+                backdrop=True,
+            )
+            self.assertTrue(drawn)
+            self.assertGreater(int(np.count_nonzero(canvas != 24)), 0)
+
+
 class ScanStatusTests(unittest.TestCase):
     """二维码 + 图纸姿态的综合状态测试。"""
 

@@ -88,7 +88,7 @@ except Exception as exc:  # OpenCV / pyzbar / numpy 任一缺失
     FrameAnalysis = None  # type: ignore[assignment]
     ScanStatus = None  # type: ignore[assignment]
     DEFAULT_MIN_PAPER_AREA_RATIO = 0.04
-    DEFAULT_TILT_THRESHOLD_DEG = 8.0
+    DEFAULT_TILT_THRESHOLD_DEG = 5.0
     SCANNER_AVAILABLE = False
     SCANNER_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
@@ -715,7 +715,7 @@ class CameraCanvas(QWidget):
         scale_x = target.width() / frame_size[0]
         scale_y = target.height() / frame_size[1]
 
-        accent = QColor(96, 232, 184) if not pose.needs_correction else QColor(255, 184, 92)
+        accent = QColor(96, 232, 184) if not pose.needs_correction else QColor(255, 92, 92)
         polygon = QPolygonF(
             [
                 QPointF(target.left() + point[0] * scale_x, target.top() + point[1] * scale_y)
@@ -860,7 +860,7 @@ class CameraCanvas(QWidget):
             "PAPER TILT",
         )
         if pose is not None and getattr(pose, "found", False):
-            angle_color = QColor(96, 232, 184) if not pose.needs_correction else QColor(255, 184, 92)
+            angle_color = QColor(96, 232, 184) if not pose.needs_correction else QColor(255, 92, 92)
             painter.setFont(self._angle_font)
             painter.setPen(angle_color)
             painter.drawText(
@@ -1431,9 +1431,10 @@ class StandbyWindow(QWidget):
     def _update_linkage(self, frame: Any, analysis: Any) -> None:
         """只有「二维码 + 图纸水平」稳定成立时才允许联动，倾斜时只提示校正。"""
         status_value = getattr(getattr(analysis, "status", None), "value", "")
-        code = getattr(analysis, "code_data", None)
+        code = getattr(analysis, "code_id", "") or getattr(analysis, "code_data", None)
+        is_straight = bool(getattr(analysis, "is_straight", False))
 
-        if status_value == "ready" and code:
+        if status_value == "ready" and is_straight and code:
             if code == self._candidate_code:
                 self._ready_streak += 1
             else:
