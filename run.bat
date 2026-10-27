@@ -38,20 +38,21 @@ if errorlevel 1 (
 )
 
 rem Verify runtime dependencies; install them automatically on first run.
-%PYTHON% -c "from PyQt5 import QtWidgets, QtMultimedia; import cv2, numpy, pyzbar" >nul 2>nul
+%PYTHON% -c "from PyQt5 import QtWidgets, QtMultimedia; import cv2, numpy, pyzbar, PIL" >nul 2>nul
 if errorlevel 1 (
     echo [SETUP] Missing dependencies. Installing from requirements.txt ...
     echo.
     %PYTHON% -m pip install -r requirements.txt
     if errorlevel 1 goto :install_failed
-    %PYTHON% -c "from PyQt5 import QtWidgets, QtMultimedia; import cv2, numpy, pyzbar" >nul 2>nul
+    %PYTHON% -c "from PyQt5 import QtWidgets, QtMultimedia; import cv2, numpy, pyzbar, PIL" >nul 2>nul
     if errorlevel 1 goto :install_failed
 )
 
 echo ==================================================
 echo  Alien Garden Interactive Showcase
-echo  Fullscreen + camera QR / paper pose detection
-echo  ESC: quit    C: camera on/off    F11: window/fullscreen
+echo  Fullscreen standby video + camera QR / pose check
+echo  SPACE / ENTER: capture    C: preview on/off
+echo  F11: window/fullscreen    ESC: quit
 echo ==================================================
 echo.
 %PYTHON% main.py %*

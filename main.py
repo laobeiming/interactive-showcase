@@ -9,20 +9,21 @@
     python main.py --no-camera --selftest       # 终端自检（不依赖摄像头）
 
 默认行为：
-    * 全屏无边框显示；
-    * 自动扫描 assets/videos 下的待机视频；
-    * 启动后台 VisionWorker，调用 scanner.CameraScanner 检测摄像头画面中的
-      二维码与图纸倾斜角，满足条件后自动联动大屏。
+    * 全屏无边框显示，启动后循环播放待机视频；
+    * 摄像头在后台持续扫描，不打断待机画面；
+    * 按下 Space / Enter（外接 USB 大按钮）时校验图纸角度与二维码，
+      通过后保存画作并切入互动大屏，8 秒后淡出回到待机；
+    * 没有待机视频时使用内置星空呼吸画布兜底。
 
 快捷键：
-    C    打开 / 关闭摄像头实时扫描（联动后按 C 返回扫描页）
-    ESC  退出程序
-    F11  全屏 / 窗口切换（调试用）
+    Space / Enter  拍照触发（对应展台外部 USB 大按钮）
+    C              摄像头预览 / 待机视频切换（摄像头保持后台运行）
+    ESC            退出程序
+    F11            全屏 / 窗口切换（调试用）
 
-联动逻辑：
-    摄像头画面中同时满足「检测到图纸 + 倾斜角 ≤ 阈值 + 二维码识别成功」并稳定
-    若干帧后，自动切入场景联动页；图纸倾斜超阈值时只在扫描页提示校正方向，
-    不会误触发大屏。默认 8 秒后自动返回扫描页，可重复触发。
+状态机：
+    STANDBY（待机视频） → 按键校验成功 → INTERACTIVE（互动动效）
+    → 8 秒后 → RESET（淡出） → STANDBY
 
 待机视频仅作为待机背景保留；没有视频时自动使用黑色呼吸文字待机页。
 """
@@ -30,18 +31,29 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import math
 import random
+import re
+import struct
 import sys
 import threading
 import time
+import wave
 from dataclasses import dataclass
+from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
 
 import numpy as np
+
+try:
+    import cv2
+except Exception:  # 摄像头模块缺失时仍允许待机页启动
+    cv2 = None  # type: ignore[assignment]
 from PyQt5.QtCore import QPointF, QRectF, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import (
     QBrush,
@@ -94,6 +106,7 @@ except Exception as exc:  # OpenCV / pyzbar / numpy 任一缺失
 
 BASE_DIR = Path(__file__).resolve().parent
 VIDEO_DIR = BASE_DIR / "assets" / "videos"
+CAPTURE_DIR = BASE_DIR / "captures"
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".webm", ".m4v"}
 PREFERRED_VIDEO_KEYWORDS = ("standby", "idle", "waiting", "daiji", "待机")
 
@@ -103,6 +116,21 @@ TRIGGER_COOLDOWN_SECONDS = 3.0
 DEFAULT_SCENE_SECONDS = 8.0
 CAMERA_ANALYSIS_INTERVAL = 0.12
 CAMERA_FRAME_INTERVAL = 1.0 / 24.0
+
+# 按键触发 / 状态机 / 转场参数
+SCENE_FADE_OUT_MS = 480
+SCENE_FADE_IN_MS = 520
+SHUTTER_FLASH_MS = 180
+PROMPT_DEFAULT_MS = 2400
+BUTTON_DEBOUNCE_SECONDS = 0.45
+
+
+class ShowcaseState(str, Enum):
+    """大屏三态状态机：待机 / 互动 / 复位。"""
+
+    STANDBY = "standby"
+    INTERACTIVE = "interactive"
+    RESET = "reset"
 
 TITLE_FONT_CANDIDATES = (
     "HarmonyOS Sans SC",
@@ -128,7 +156,7 @@ def pick_font_family(candidates: tuple[str, ...]) -> str:
 
 
 def find_standby_video(explicit_path: Optional[Path] = None) -> Optional[Path]:
-    """确定待机视频：优先使用显式路径，否则扫描 assets/videos 目录。"""
+    """确定待机视频：优先显式路径，其次 assets/videos，最后项目根目录。"""
     if explicit_path is not None:
         path = explicit_path.expanduser()
         if not path.is_absolute():
@@ -138,16 +166,18 @@ def find_standby_video(explicit_path: Optional[Path] = None) -> Optional[Path]:
         LOGGER.warning("指定的视频不可用：%s", path)
         return None
 
-    if not VIDEO_DIR.is_dir():
-        return None
-
-    candidates = [
-        item
-        for item in sorted(VIDEO_DIR.iterdir())
-        if item.is_file()
-        and item.suffix.lower() in VIDEO_SUFFIXES
-        and item.stat().st_size > 0
-    ]
+    candidates: list[Path] = []
+    for directory in (VIDEO_DIR, BASE_DIR):
+        if not directory.is_dir():
+            continue
+        for item in sorted(directory.iterdir()):
+            if (
+                item.is_file()
+                and item.suffix.lower() in VIDEO_SUFFIXES
+                and item.stat().st_size > 0
+                and item not in candidates
+            ):
+                candidates.append(item)
     if not candidates:
         return None
 
@@ -245,6 +275,34 @@ def bgr_to_qimage(frame: Any) -> QImage:
     else:
         image = QImage(data, width, height, frame.strides[0], QImage.Format_BGR888)
     return image.copy()
+
+
+@lru_cache(maxsize=1)
+def build_shutter_wav() -> bytes:
+    """合成一段短促快门“咔嗒”声，避免依赖外部音频素材。"""
+    sample_rate = 44100
+    duration = 0.12
+    rng = random.Random(2024)
+    frames = bytearray()
+    total = int(sample_rate * duration)
+    for index in range(total):
+        t = index / sample_rate
+        envelope = math.exp(-t * 46.0)
+        click = math.sin(math.tau * 2100.0 * t) * 0.72
+        noise = (rng.random() * 2.0 - 1.0) * 0.32
+        second_click = 0.0
+        if 0.032 <= t <= 0.052:
+            second_click = math.sin(math.tau * 3200.0 * (t - 0.032)) * 0.55
+        value = max(-1.0, min(1.0, (click + noise + second_click) * envelope))
+        frames.extend(struct.pack("<h", int(value * 32767)))
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(bytes(frames))
+    return buffer.getvalue()
 
 
 class VisionWorker(QThread):
@@ -607,7 +665,7 @@ class CameraCanvas(QWidget):
         value = getattr(getattr(analysis, "status", None), "value", "")
         message = getattr(analysis, "message", "")
         if value == "ready":
-            return QColor(96, 232, 184), "识别成功", "图纸水平 · 二维码匹配 · 正在联动大屏"
+            return QColor(96, 232, 184), "可以拍照", "图纸已摆正 · 二维码有效 · 请按 Space / Enter"
         if value == "tilted":
             return QColor(255, 184, 92), "请摆正图纸", message
         if value == "no_code":
@@ -894,7 +952,7 @@ class CameraCanvas(QWidget):
         painter.drawText(
             QRectF(32, bounds.height() - 32, bounds.width() - 64, 20),
             Qt.AlignHCenter | Qt.AlignVCenter,
-            "C 关闭摄像头   ·   ESC 退出",
+            "C 预览切换   ·   Space / Enter 拍照   ·   ESC 退出",
         )
 
 
@@ -1031,52 +1089,38 @@ class SceneCanvas(QWidget):
         theme: SceneTheme,
         accent: QColor,
     ) -> None:
-        left = bounds.width() * 0.075
-        block_width = bounds.width() * 0.50
+        block_width = min(bounds.width() * 0.72, 980.0)
+        left = bounds.center().x() - block_width / 2.0
 
         painter.setFont(self._kicker_font)
         painter.setPen(accent)
         painter.drawText(
-            QRectF(left, bounds.height() * 0.20, block_width, 22),
-            Qt.AlignLeft | Qt.AlignVCenter,
+            QRectF(left, bounds.height() * 0.045, block_width, 22),
+            Qt.AlignHCenter | Qt.AlignVCenter,
             "SCENE LINKED  /  二维码已匹配",
         )
 
-        title_size = int(max(30, min(78, bounds.height() * 0.092)))
+        title_size = int(max(26, min(64, bounds.height() * 0.072)))
         title_font = QFont(self._family, title_size, QFont.Bold)
         painter.setFont(title_font)
         painter.setPen(QColor(240, 252, 248))
         painter.drawText(
-            QRectF(left, bounds.height() * 0.27, block_width, title_size * 1.35),
-            Qt.AlignLeft | Qt.AlignVCenter,
+            QRectF(left, bounds.height() * 0.075, block_width, title_size * 1.2),
+            Qt.AlignHCenter | Qt.AlignVCenter,
             theme.title,
         )
 
         painter.setFont(self._body_font)
         painter.setPen(QColor(176, 206, 198))
         painter.drawText(
-            QRectF(left, bounds.height() * 0.27 + title_size * 1.4, block_width, 62),
-            Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap,
+            QRectF(
+                left,
+                bounds.height() * 0.075 + title_size * 1.25,
+                block_width,
+                44,
+            ),
+            Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap,
             theme.subtitle,
-        )
-
-        pill_rect = QRectF(left, bounds.height() * 0.72, min(block_width, 440), 38)
-        painter.setBrush(QBrush(QColor(8, 22, 20, 200)))
-        painter.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 120), 1.2))
-        painter.drawRoundedRect(pill_rect, 19, 19)
-
-        painter.setFont(self._mono_font)
-        painter.setPen(QColor(214, 242, 232))
-        qr_label = self._qr_data or theme.key.upper()
-        qr_label = QFontMetrics(self._mono_font).elidedText(qr_label, Qt.ElideMiddle, int(pill_rect.width() - 40))
-        painter.drawText(pill_rect.adjusted(18, 0, -14, 0), Qt.AlignLeft | Qt.AlignVCenter, f"ID  {qr_label}")
-
-        painter.setFont(self._small_font)
-        painter.setPen(QColor(142, 174, 168))
-        painter.drawText(
-            QRectF(left, bounds.height() * 0.72 + 50, block_width, 22),
-            Qt.AlignLeft | Qt.AlignVCenter,
-            f"按 C 返回扫描台  ·  {self.remaining_seconds():.0f} 秒后自动返回",
         )
 
 
@@ -1087,11 +1131,11 @@ class SceneCanvas(QWidget):
         theme: SceneTheme,
         accent: QColor,
     ) -> None:
-        card_width = min(bounds.width() * 0.30, bounds.height() * 0.54)
-        card_height = card_width * 1.22
+        card_height = min(bounds.height() * 0.60, bounds.width() * 0.44 * 1.18)
+        card_width = card_height / 1.18
         card = QRectF(
-            bounds.width() * 0.635,
-            (bounds.height() - card_height) / 2.0 - 16,
+            bounds.center().x() - card_width / 2.0,
+            bounds.height() * 0.30,
             card_width,
             card_height,
         )
@@ -1151,10 +1195,14 @@ class SceneCanvas(QWidget):
 
         painter.setFont(self._small_font)
         painter.setPen(accent)
+        qr_label = self._qr_data or theme.key.upper()
+        qr_label = QFontMetrics(self._small_font).elidedText(
+            qr_label, Qt.ElideMiddle, int(card.width() - 40)
+        )
         painter.drawText(
             QRectF(card.left() + 20, card.bottom() - 58, card.width() - 40, 40),
             Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
-            f"主题 · {theme.title}\n已投射至大屏",
+            f"{theme.title} · 已投射至大屏\nID {qr_label}",
         )
 
     def _draw_progress(self, painter: QPainter, bounds: QRectF, accent: QColor) -> None:
@@ -1164,6 +1212,11 @@ class SceneCanvas(QWidget):
             QRectF(bounds.width() * 0.075, 24, bounds.width() * 0.40, 22),
             Qt.AlignLeft | Qt.AlignVCenter,
             "ALIEN GARDEN  /  IMMERSIVE SHOWCASE",
+        )
+        painter.drawText(
+            QRectF(bounds.width() * 0.55, 24, bounds.width() * 0.375, 22),
+            Qt.AlignRight | Qt.AlignVCenter,
+            f"C 返回扫描台  ·  {self.remaining_seconds():.0f} 秒后自动返回",
         )
 
         track = QRectF(
@@ -1181,6 +1234,271 @@ class SceneCanvas(QWidget):
         painter.drawRoundedRect(fill, 2, 2)
 
 
+class ShowcaseOverlay(QWidget):
+    """覆盖在大屏最上层的黑色淡出层 + 居中动态提示。
+
+    使用独立的 ``Qt.Tool`` 顶层窗口，确保 QVideoWidget 播放待机视频时，
+    提示文字和淡入淡出也能稳定覆盖在画面上。
+    """
+
+    def __init__(self, anchor: QWidget) -> None:
+        super().__init__(
+            anchor,
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus,
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setFocusPolicy(Qt.NoFocus)
+
+        self._fade_color = QColor(0, 0, 0)
+        self._fade_opacity = 0.0
+        self._fade_from = 0.0
+        self._fade_target = 0.0
+        self._fade_started = 0.0
+        self._fade_duration = 1
+        self._fade_running = False
+        self._fade_callback: Any = None
+
+        self._message = ""
+        self._subtitle = ""
+        self._message_started = 0.0
+        self._message_visible = False
+        self._accent = QColor(255, 92, 92)
+
+        family = pick_font_family(TITLE_FONT_CANDIDATES)
+        self._title_font = QFont(family, 27, QFont.DemiBold)
+        self._subtitle_font = QFont(family, 14)
+        self._icon_font = QFont(family, 25, QFont.Bold)
+
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(16)
+        self._anim_timer.timeout.connect(self._on_tick)
+
+        self._message_timer = QTimer(self)
+        self._message_timer.setSingleShot(True)
+        self._message_timer.timeout.connect(self.clear_message)
+
+        self.hide()
+
+    # ---- 生命周期 / 几何同步 ------------------------------------------
+    def sync_geometry(self, anchor: QWidget) -> None:
+        """让覆盖层始终与主窗口客户区重合。"""
+        self.setGeometry(anchor.geometry())
+        if self.isVisible():
+            self.raise_()
+
+    def _ensure_visible(self) -> None:
+        if self.width() <= 0 or self.height() <= 0:
+            return
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+
+    def _maybe_hide(self) -> None:
+        if not self._message_visible and not self._fade_running:
+            self._anim_timer.stop()
+            self.hide()
+
+    # ---- 淡入淡出 -----------------------------------------------------
+    def fade_to(
+        self,
+        target: float,
+        duration_ms: int = 400,
+        *,
+        color: Tuple[int, int, int] = (0, 0, 0),
+        on_finished: Any = None,
+        start_opacity: Optional[float] = None,
+    ) -> None:
+        if start_opacity is not None:
+            self._fade_opacity = max(0.0, min(1.0, float(start_opacity)))
+        self._fade_from = self._fade_opacity
+        self._fade_target = max(0.0, min(1.0, float(target)))
+        self._fade_color = QColor(*color)
+        self._fade_duration = max(1, int(duration_ms))
+        self._fade_started = time.monotonic()
+        self._fade_running = True
+        self._fade_callback = on_finished
+        self._ensure_visible()
+        self._anim_timer.start()
+        self.update()
+
+    def flash(
+        self,
+        color: Tuple[int, int, int] = (255, 255, 255),
+        duration_ms: int = SHUTTER_FLASH_MS,
+        *,
+        on_finished: Any = None,
+    ) -> None:
+        """模拟快门白闪。"""
+        self.fade_to(
+            0.0,
+            duration_ms,
+            color=color,
+            on_finished=on_finished,
+            start_opacity=1.0,
+        )
+
+    def _on_tick(self) -> None:
+        if self._fade_running:
+            elapsed = time.monotonic() - self._fade_started
+            progress = min(1.0, elapsed / max(1e-3, self._fade_duration / 1000.0))
+            eased = progress * progress * (3.0 - 2.0 * progress)
+            self._fade_opacity = (
+                self._fade_from + (self._fade_target - self._fade_from) * eased
+            )
+            if progress >= 1.0:
+                self._fade_opacity = self._fade_target
+                self._fade_running = False
+                callback = self._fade_callback
+                self._fade_callback = None
+                if callback is not None:
+                    callback()
+        self.update()
+        self._maybe_hide()
+
+    # ---- 居中提示 -----------------------------------------------------
+    def show_message(
+        self,
+        text: str,
+        *,
+        success: bool = False,
+        duration_ms: int = PROMPT_DEFAULT_MS,
+        subtitle: Optional[str] = None,
+    ) -> None:
+        self._message = str(text)
+        self._subtitle = (
+            subtitle
+            if subtitle is not None
+            else (
+                "正在进入外星花园互动…"
+                if success
+                else "请调整画纸后再按 Space / Enter"
+            )
+        )
+        self._accent = QColor(96, 232, 184) if success else QColor(255, 92, 92)
+        self._message_started = time.monotonic()
+        self._message_visible = True
+        self._message_timer.start(max(600, int(duration_ms)))
+        self._ensure_visible()
+        self._anim_timer.start()
+        self.update()
+
+    def clear_message(self) -> None:
+        self._message_timer.stop()
+        self._message_visible = False
+        self.update()
+        self._maybe_hide()
+
+    @property
+    def message(self) -> str:
+        return self._message
+
+    @property
+    def message_visible(self) -> bool:
+        return self._message_visible
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
+        if self._fade_opacity > 0.001:
+            fade = QColor(self._fade_color)
+            fade.setAlphaF(self._fade_opacity)
+            painter.fillRect(self.rect(), fade)
+
+        if self._message_visible:
+            self._paint_message(painter)
+        painter.end()
+
+    def _paint_message(self, painter: QPainter) -> None:
+        bounds = QRectF(self.rect())
+        elapsed = max(0.0, time.monotonic() - self._message_started)
+        pulse = (math.sin(elapsed * 4.2) + 1.0) / 2.0
+        bob = math.sin(elapsed * 3.4) * 5.0
+
+        width = min(bounds.width() * 0.78, 980.0)
+        height = min(max(150.0, bounds.height() * 0.23), 210.0)
+        panel = QRectF(
+            bounds.center().x() - width / 2.0,
+            bounds.center().y() - height / 2.0 + bob,
+            width,
+            height,
+        )
+
+        glow = QRadialGradient(panel.center(), width * 0.58)
+        glow.setColorAt(
+            0.0,
+            QColor(
+                self._accent.red(),
+                self._accent.green(),
+                self._accent.blue(),
+                int(80 + 55 * pulse),
+            ),
+        )
+        glow.setColorAt(
+            1.0,
+            QColor(
+                self._accent.red(),
+                self._accent.green(),
+                self._accent.blue(),
+                0,
+            ),
+        )
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(glow))
+        painter.drawEllipse(panel.center(), width * 0.52, height * 0.92)
+
+        painter.setBrush(QBrush(QColor(4, 9, 13, 236)))
+        border = QColor(self._accent)
+        border.setAlpha(int(150 + 95 * pulse))
+        painter.setPen(QPen(border, 2.0 + 1.4 * pulse))
+        painter.drawRoundedRect(panel, 24, 24)
+
+        icon_center = QPointF(panel.left() + 72.0, panel.center().y())
+        icon_fill = QColor(self._accent)
+        icon_fill.setAlpha(44)
+        painter.setBrush(QBrush(icon_fill))
+        painter.setPen(QPen(self._accent, 2.0))
+        painter.drawEllipse(icon_center, 34.0, 34.0)
+        painter.setFont(self._icon_font)
+        painter.setPen(self._accent)
+        painter.drawText(
+            QRectF(icon_center.x() - 34, icon_center.y() - 34, 68, 68),
+            Qt.AlignCenter,
+            "✓" if self._accent.green() > 180 else "!",
+        )
+
+        text_left = panel.left() + 126.0
+        text_width = panel.width() - 156.0
+        painter.setFont(self._title_font)
+        painter.setPen(QColor(242, 252, 248))
+        painter.drawText(
+            QRectF(text_left, panel.top() + 24.0, text_width, height - 80.0),
+            Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
+            self._message,
+        )
+
+        painter.setFont(self._subtitle_font)
+        painter.setPen(
+            QColor(
+                self._accent.red(),
+                self._accent.green(),
+                self._accent.blue(),
+                220,
+            )
+        )
+        painter.drawText(
+            QRectF(text_left, panel.bottom() - 46.0, text_width, 26.0),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            self._subtitle,
+        )
+
+
 class StandbyWindow(QWidget):
     """全屏无边框展示窗口：待机视频 / 摄像头扫描 / 场景联动三态切换。"""
 
@@ -1195,6 +1513,8 @@ class StandbyWindow(QWidget):
         camera_height: int = 720,
         start_camera: bool = False,
         camera_enabled: bool = True,
+        start_preview: bool = False,
+        capture_dir: Optional[Path] = None,
         tilt_threshold: float = DEFAULT_TILT_THRESHOLD_DEG,
         min_paper_ratio: float = DEFAULT_MIN_PAPER_AREA_RATIO,
         scene_seconds: float = DEFAULT_SCENE_SECONDS,
@@ -1219,18 +1539,26 @@ class StandbyWindow(QWidget):
         self._camera_width = camera_width
         self._camera_height = camera_height
         self._start_camera_on_launch = start_camera
+        self._start_preview = bool(start_preview)
         self._camera_enabled = bool(camera_enabled and SCANNER_AVAILABLE)
         self._tilt_threshold = float(tilt_threshold)
         self._min_paper_ratio = float(min_paper_ratio)
         self._scene_seconds = max(2.0, float(scene_seconds))
+        self._capture_dir = Path(capture_dir) if capture_dir is not None else CAPTURE_DIR
 
         self._vision_worker: Optional[VisionWorker] = None
         self._camera_error = ""
+        self._last_frame: Any = None
         self._last_analysis: Any = None
+        self._last_capture_path: Optional[Path] = None
         self._candidate_code: Optional[str] = None
         self._ready_streak = 0
         self._last_trigger_at = 0.0
+        self._last_button_at = 0.0
         self._trigger_count = 0
+        self._preview_mode = False
+        self._state = ShowcaseState.STANDBY
+        self._shutter_wav: Optional[bytes] = None
 
         self._scene_timer = QTimer(self)
         self._scene_timer.setSingleShot(True)
@@ -1260,6 +1588,8 @@ class StandbyWindow(QWidget):
             self._setup_video(self._video_path)
 
         self._standby_widget = self._stack.currentWidget()
+        self._overlay = ShowcaseOverlay(self)
+        self._overlay.sync_geometry(self)
 
     # ---- 视频播放 -----------------------------------------------------
     def _setup_video(self, video_path: Path) -> None:
@@ -1302,7 +1632,9 @@ class StandbyWindow(QWidget):
         if self._player is not None:
             self._player.stop()
         self._standby_widget = self._idle_canvas
-        self._stack.setCurrentWidget(self._idle_canvas)
+        # 若当前正在摄像头预览或互动页，只更新待机兜底，不打断当前画面
+        if self._stack.currentWidget() is self._video_widget:
+            self._stack.setCurrentWidget(self._idle_canvas)
 
     # ---- 摄像头扫描 ---------------------------------------------------
     def _pause_standby_video(self) -> None:
@@ -1322,27 +1654,33 @@ class StandbyWindow(QWidget):
         self._pause_standby_video()
         self._scene_timer.stop()
         self._scene_canvas.clear_scene()
+        self._preview_mode = True
         self._stack.setCurrentWidget(self._camera_canvas)
         self._camera_canvas.setFocus()
 
     def _show_standby(self) -> None:
         self._scene_timer.stop()
         self._scene_canvas.clear_scene()
+        self._preview_mode = False
         self._stack.setCurrentWidget(self._standby_widget)
         self._resume_standby_video()
+        self.setFocus()
 
-    def _start_camera(self) -> None:
+    def _start_camera(self, *, show_preview: bool = False) -> None:
         if not self._camera_enabled:
             message = "视觉模块不可用" if not SCANNER_AVAILABLE else "摄像头功能已禁用"
-            self._camera_canvas.set_error(message)
-            self._stack.setCurrentWidget(self._camera_canvas)
             LOGGER.warning(message)
             if not SCANNER_AVAILABLE:
                 LOGGER.warning("scanner 导入失败：%s", SCANNER_IMPORT_ERROR)
+            if show_preview:
+                self._camera_canvas.set_error(message)
+                self._preview_mode = True
+                self._stack.setCurrentWidget(self._camera_canvas)
             return
 
         if self._vision_worker is not None:
-            self._show_camera()
+            if show_preview:
+                self._show_camera()
             return
 
         config = CameraConfig(
@@ -1363,10 +1701,11 @@ class StandbyWindow(QWidget):
         self._vision_worker = worker
         self._camera_error = ""
         self._camera_canvas.clear()
-        self._show_camera()
         worker.start()
+        if show_preview:
+            self._show_camera()
         LOGGER.info(
-            "启动摄像头扫描：index=%s，请求分辨率=%sx%s，倾斜阈值=±%.1f°",
+            "启动后台摄像头扫描：index=%s，请求分辨率=%sx%s，倾斜阈值=±%.1f°",
             self._camera_index,
             self._camera_width,
             self._camera_height,
@@ -1382,18 +1721,26 @@ class StandbyWindow(QWidget):
         self._camera_canvas.clear()
         self._ready_streak = 0
         self._candidate_code = None
+        self._last_frame = None
         self._last_analysis = None
         self._show_standby()
         LOGGER.info("摄像头扫描已停止")
 
     def _toggle_camera(self) -> None:
-        if self._stack.currentWidget() is self._scene_canvas:
+        if self._state is ShowcaseState.INTERACTIVE:
             self._finish_scene()
             return
+        if self._state is ShowcaseState.RESET:
+            return
+        if not self._camera_enabled:
+            self._overlay.show_message("摄像头未启用，无法进入扫描预览", success=False)
+            return
         if self._vision_worker is None:
-            self._start_camera()
+            self._start_camera(show_preview=True)
+        elif self._preview_mode:
+            self._show_standby()
         else:
-            self._stop_camera()
+            self._show_camera()
 
     def _on_camera_opened(self, message: str) -> None:
         self._camera_error = ""
@@ -1403,6 +1750,12 @@ class StandbyWindow(QWidget):
         self._camera_error = message
         self._camera_canvas.set_error(message)
         LOGGER.error("摄像头异常：%s", message)
+        if self._preview_mode:
+            self._overlay.show_message(
+                "摄像头连接异常，请检查高拍仪",
+                success=False,
+                subtitle=message,
+            )
 
     def _on_vision_finished(self) -> None:
         worker = self._vision_worker
@@ -1414,90 +1767,260 @@ class StandbyWindow(QWidget):
             LOGGER.info("视觉线程已结束")
 
 
-    # ---- 联动逻辑 -----------------------------------------------------
+    # ---- 按键 / 外部大按钮触发 ----------------------------------------
+    @property
+    def state(self) -> str:
+        """当前大屏状态：``standby`` / ``interactive`` / ``reset``。"""
+        return self._state.value
+
+    @property
+    def last_capture_path(self) -> Optional[Path]:
+        return self._last_capture_path
+
     def _on_frame_ready(self, frame: Any, analysis: Any) -> None:
-        self._camera_canvas.set_frame(frame, analysis)
+        # 即使当前显示待机视频，也持续保留最新一帧与分析结果供按键拍照使用。
+        self._last_frame = frame
         self._last_analysis = analysis
-        if analysis is None:
-            return
-        if self._stack.currentWidget() is not self._camera_canvas:
-            return
-        self._update_linkage(frame, analysis)
+        self._camera_canvas.set_frame(frame, analysis)
 
-    def _reset_trigger_streak(self) -> None:
-        self._ready_streak = 0
-        self._candidate_code = None
+    def _reject_trigger(self, message: str) -> bool:
+        self._overlay.show_message(message, success=False)
+        QApplication.beep()
+        LOGGER.info("按键触发被拒绝：%s", message)
+        return False
 
-    def _update_linkage(self, frame: Any, analysis: Any) -> None:
-        """只有「二维码 + 图纸水平」稳定成立时才允许联动，倾斜时只提示校正。"""
-        status_value = getattr(getattr(analysis, "status", None), "value", "")
-        code = getattr(analysis, "code_id", "") or getattr(analysis, "code_data", None)
+    def trigger_capture(self) -> bool:
+        """供 Space / Enter（或外部 USB 大按钮）调用的拍照入口。
+
+        Returns:
+            True 表示校验通过并已进入互动状态；False 表示被拒绝。
+        """
+        if self._state is ShowcaseState.INTERACTIVE:
+            self._overlay.show_message(
+                "作品正在大屏展示，请稍候",
+                success=True,
+                duration_ms=1400,
+            )
+            return False
+        if self._state is ShowcaseState.RESET:
+            return False
+
+        if not self._camera_enabled:
+            return self._reject_trigger("摄像头未启用，无法拍照")
+
+        frame = self._last_frame
+        analysis = self._last_analysis
+        if frame is None or analysis is None:
+            return self._reject_trigger("扫描台尚未就绪，请将画作放入扫描区后再按")
+
         is_straight = bool(getattr(analysis, "is_straight", False))
+        code_id = str(
+            getattr(analysis, "code_id", "")
+            or getattr(analysis, "code_data", "")
+            or ""
+        ).strip()
 
-        if status_value == "ready" and is_straight and code:
-            if code == self._candidate_code:
-                self._ready_streak += 1
-            else:
-                self._candidate_code = code
-                self._ready_streak = 1
-
-            if self._ready_streak >= TRIGGER_STABLE_FRAMES:
-                now = time.monotonic()
-                if now - self._last_trigger_at >= TRIGGER_COOLDOWN_SECONDS:
-                    self._last_trigger_at = now
-                    self._trigger_scene(frame, analysis, code)
-            return
-
-        if status_value == "tilted":
-            self._reset_trigger_streak()
+        if not is_straight:
             pose = getattr(analysis, "pose", None)
-            if pose is not None:
-                now = time.monotonic()
-                if now - getattr(self, "_last_tilt_log", 0.0) > 2.0:
-                    self._last_tilt_log = now
-                    LOGGER.info(
-                        "图纸倾斜 %+.1f°（阈值 ±%.1f°）：%s",
-                        pose.angle_deg,
-                        pose.tilt_threshold,
-                        pose.correction_hint,
-                    )
-            return
+            if pose is not None and getattr(pose, "found", False):
+                angle = abs(float(getattr(pose, "angle_deg", 0.0)))
+                message = f"图纸未摆正，请调整后再按（偏离 {angle:.1f}°）"
+            else:
+                message = "未识别到完整图纸，请将画作平放入扫描区"
+            return self._reject_trigger(message)
 
-        self._reset_trigger_streak()
+        if not code_id:
+            return self._reject_trigger("未识别到二维码，请将二维码对准扫描区后再按")
 
-    def _trigger_scene(self, frame: Any, analysis: Any, code: str) -> None:
-        theme = resolve_scene_theme(code)
-        snapshot = bgr_to_qimage(frame)
+        # 防止外接按钮抖动 / 键盘重复事件在极短时间内重复触发
+        now = time.monotonic()
+        if now - self._last_button_at < BUTTON_DEBOUNCE_SECONDS:
+            return False
+        self._last_button_at = now
+
+        artwork = self._extract_artwork(frame, analysis)
+        if artwork is None or getattr(artwork, "size", 0) == 0:
+            return self._reject_trigger("未能截取画作，请调整图纸位置后重试")
+
+        snapshot = bgr_to_qimage(artwork)
+        capture_path = self._save_artwork(snapshot, code_id)
+        if capture_path is None:
+            return self._reject_trigger("画作保存失败，请检查 captures 目录权限")
+
+        self._last_capture_path = capture_path
+        self._play_shutter_feedback()
+        self._overlay.show_message(
+            "拍照成功，正在进入外星花园…",
+            success=True,
+            duration_ms=900,
+        )
+        self._trigger_scene(snapshot, analysis, code_id, capture_path)
+        return True
+
+    def _extract_artwork(self, frame: Any, analysis: Any) -> Any:
+        """优先透视校正旋转纸张，失败时退回外接矩形裁切。"""
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return None
+
         pose = getattr(analysis, "pose", None)
-        if pose is not None and getattr(pose, "rect", None):
-            x, y, width, height = pose.rect
-            if width > 24 and height > 24:
-                x0 = max(0, int(x))
-                y0 = max(0, int(y))
-                crop = frame[y0 : y0 + int(height), x0 : x0 + int(width)]
-                if crop.size > 0:
-                    snapshot = bgr_to_qimage(crop)
+        image: Any = None
+        quad = (
+            getattr(pose, "quad", None)
+            if pose is not None and getattr(pose, "found", False)
+            else None
+        )
+        if cv2 is not None and quad is not None and len(quad) == 4:
+            points = np.asarray(quad, dtype=np.float32)
+            if points.shape == (4, 2):
+                top = float(np.linalg.norm(points[0] - points[1]))
+                bottom = float(np.linalg.norm(points[3] - points[2]))
+                left = float(np.linalg.norm(points[0] - points[3]))
+                right = float(np.linalg.norm(points[1] - points[2]))
+                width = max(top, bottom)
+                height = max(left, right)
+                if width >= 80.0 and height >= 80.0:
+                    target = np.array(
+                        [
+                            [0, 0],
+                            [width - 1, 0],
+                            [width - 1, height - 1],
+                            [0, height - 1],
+                        ],
+                        dtype=np.float32,
+                    )
+                    try:
+                        matrix = cv2.getPerspectiveTransform(points, target)
+                        warped = cv2.warpPerspective(
+                            frame,
+                            matrix,
+                            (int(round(width)), int(round(height))),
+                            flags=cv2.INTER_LINEAR,
+                        )
+                        if getattr(warped, "size", 0) > 0:
+                            image = warped
+                    except Exception as exc:
+                        LOGGER.debug("透视裁切失败，退回矩形裁切：%s", exc)
 
-        self._scene_canvas.set_scene(theme, code, snapshot, duration=self._scene_seconds)
+        if image is None and pose is not None and getattr(pose, "rect", None):
+            x, y, width, height = (int(value) for value in pose.rect)
+            if width > 24 and height > 24:
+                frame_height, frame_width = frame.shape[:2]
+                x0 = max(0, x)
+                y0 = max(0, y)
+                x1 = min(frame_width, x + width)
+                y1 = min(frame_height, y + height)
+                if x1 > x0 and y1 > y0:
+                    image = frame[y0:y1, x0:x1].copy()
+
+        if image is None or getattr(image, "size", 0) == 0:
+            image = frame.copy()
+        return image
+
+    def _save_artwork(self, image: QImage, code_id: str) -> Optional[Path]:
+        """把观众画作保存为 JPG，返回实际文件路径。"""
+        if image.isNull():
+            return None
+        try:
+            self._capture_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            LOGGER.error("创建 captures 目录失败：%s", exc)
+            return None
+
+        safe_code = re.sub(r"[^0-9A-Za-z_-]+", "_", code_id or "").strip("_")
+        safe_code = safe_code[:48] or "artwork"
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        target = self._capture_dir / f"artwork_{stamp}_{safe_code}.jpg"
+        for attempt in range(2):
+            path = target
+            if attempt > 0:
+                path = target.with_name(
+                    f"{target.stem}_{int(time.time() * 1000) % 1000}{target.suffix}"
+                )
+            try:
+                if image.save(str(path), "JPG", 92):
+                    LOGGER.info("画作已保存：%s", path)
+                    return path
+            except Exception as exc:
+                LOGGER.warning("保存画作失败：%s", exc)
+        LOGGER.error("无法写入画作文件：%s", target)
+        return None
+
+    def _play_shutter_feedback(self) -> None:
+        """播放快门声 + 全屏白闪。"""
+        self._overlay.flash(color=(255, 255, 255), duration_ms=SHUTTER_FLASH_MS)
+        if self._shutter_wav is None:
+            try:
+                self._shutter_wav = build_shutter_wav()
+            except Exception as exc:
+                LOGGER.debug("合成快门声失败：%s", exc)
+        if self._shutter_wav and sys.platform.startswith("win"):
+            try:
+                import winsound
+
+                winsound.PlaySound(
+                    self._shutter_wav,
+                    winsound.SND_MEMORY | winsound.SND_ASYNC,
+                )
+                return
+            except Exception as exc:
+                LOGGER.debug("播放快门声失败：%s", exc)
+        QApplication.beep()
+
+    def _trigger_scene(
+        self,
+        snapshot: QImage,
+        analysis: Any,
+        code: str,
+        capture_path: Optional[Path] = None,
+    ) -> None:
+        if self._state is not ShowcaseState.STANDBY:
+            return
+        theme = resolve_scene_theme(code)
+        self._state = ShowcaseState.INTERACTIVE
+        self._preview_mode = False
+        self._scene_canvas.set_scene(
+            theme,
+            code,
+            snapshot,
+            duration=self._scene_seconds,
+        )
         self._pause_standby_video()
         self._stack.setCurrentWidget(self._scene_canvas)
+        self.setFocus()
         self._scene_timer.start(int(self._scene_seconds * 1000))
         self._trigger_count += 1
-        self._reset_trigger_streak()
+        self._last_trigger_at = time.monotonic()
         LOGGER.info(
-            "联动触发 #%d：二维码=%s → 主题=%s（%.0f 秒后返回扫描页）",
+            "按键拍照 #%d：二维码=%s → 主题=%s，画作=%s（%.0f 秒后淡出）",
             self._trigger_count,
             code,
             theme.title,
+            capture_path or "未保存",
             self._scene_seconds,
         )
 
     def _finish_scene(self) -> None:
+        """互动展示结束：先淡出到黑场，再切回待机视频。"""
         self._scene_timer.stop()
-        if self._vision_worker is not None:
-            self._show_camera()
-        else:
-            self._show_standby()
+        if self._state is not ShowcaseState.INTERACTIVE:
+            return
+        self._state = ShowcaseState.RESET
+        self._overlay.clear_message()
+        LOGGER.info("互动展示结束，开始淡出并返回待机")
+        self._overlay.fade_to(
+            1.0,
+            SCENE_FADE_OUT_MS,
+            color=(0, 0, 0),
+            on_finished=self._complete_reset,
+        )
+
+    def _complete_reset(self) -> None:
+        if self._state is not ShowcaseState.RESET:
+            return
+        self._show_standby()
+        self._state = ShowcaseState.STANDBY
+        self._overlay.fade_to(0.0, SCENE_FADE_IN_MS, color=(0, 0, 0))
+        LOGGER.info("已返回待机视频循环，等待下一位观众")
 
     def selftest_summary(self) -> dict:
         """给 --selftest 使用的运行摘要，便于终端断言摄像头与联动状态。"""
@@ -1506,8 +2029,11 @@ class StandbyWindow(QWidget):
             "scanner_available": SCANNER_AVAILABLE,
             "camera_requested": self._start_camera_on_launch,
             "camera_enabled": self._camera_enabled,
+            "camera_preview": self._preview_mode,
             "frames": self._camera_canvas.frames,
             "triggers": self._trigger_count,
+            "state": self._state.value,
+            "last_capture": str(self._last_capture_path) if self._last_capture_path else None,
             "last_status": getattr(getattr(analysis, "status", None), "value", None),
             "last_qr": getattr(analysis, "code_data", None),
             "camera_error": self._camera_error,
@@ -1541,7 +2067,34 @@ class StandbyWindow(QWidget):
             LOGGER.info("待机页已启用：黑色背景 + 呼吸文字")
 
         if self._start_camera_on_launch:
-            self._start_camera()
+            self._start_camera(show_preview=self._start_preview)
+        else:
+            LOGGER.info("摄像头未启用，仅待机视频；Space / Enter 不会触发拍照")
+
+        self._sync_overlay_geometry()
+
+    def _sync_overlay_geometry(self) -> None:
+        overlay = getattr(self, "_overlay", None)
+        if overlay is not None:
+            overlay.sync_geometry(self)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._sync_overlay_geometry()
+
+    def moveEvent(self, event) -> None:  # noqa: N802
+        super().moveEvent(event)
+        self._sync_overlay_geometry()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._sync_overlay_geometry()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        overlay = getattr(self, "_overlay", None)
+        if overlay is not None:
+            overlay.hide()
+        super().hideEvent(event)
 
     def _toggle_fullscreen(self) -> None:
         if self.isFullScreen():
@@ -1553,6 +2106,11 @@ class StandbyWindow(QWidget):
             self.showFullScreen()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+            if not event.isAutoRepeat():
+                self.trigger_capture()
+            event.accept()
+            return
         if event.key() == Qt.Key_C:
             self._toggle_camera()
             event.accept()
@@ -1571,6 +2129,10 @@ class StandbyWindow(QWidget):
     def closeEvent(self, event) -> None:  # noqa: N802
         LOGGER.info("正在关闭展示窗口")
         self._scene_timer.stop()
+        overlay = getattr(self, "_overlay", None)
+        if overlay is not None:
+            overlay.hide()
+            overlay.close()
         worker = self._vision_worker
         self._vision_worker = None
         if worker is not None:
@@ -1589,7 +2151,7 @@ class StandbyWindow(QWidget):
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="外星花园 · 交互展示（阶段二：视觉检测与联动）")
+    parser = argparse.ArgumentParser(description="外星花园 · 交互展示（阶段三：按键触发与视频流转）")
     parser.add_argument(
         "--video",
         type=Path,
@@ -1616,6 +2178,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--no-camera",
         action="store_true",
         help="禁用摄像头（只保留待机展示）",
+    )
+    parser.add_argument(
+        "--camera-preview",
+        action="store_true",
+        help="启动时直接显示摄像头预览（默认停留在待机视频，按 C 可切换预览）",
     )
     parser.add_argument(
         "--tilt-threshold",
@@ -1692,6 +2259,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         camera_height=args.height,
         start_camera=not args.no_camera,
         camera_enabled=not args.no_camera,
+        start_preview=args.camera_preview,
         tilt_threshold=args.tilt_threshold,
         min_paper_ratio=args.min_paper_ratio,
         scene_seconds=args.scene_seconds,

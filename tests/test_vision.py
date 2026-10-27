@@ -6,6 +6,7 @@
 测试覆盖：
 * 轮廓检测估算图纸倾斜角（水平 / 顺时针 / 逆时针）；
 * 二维码 + 图纸水平 -> READY，倾斜 -> TILTED（不触发联动）；
+* main.py 的 Space / Enter 按键校验、拍照保存与 8 秒复位状态机；
 * Windows 中文路径图片读写；
 * main.py 的场景联动触发条件与稳定帧数；
 * 二维码 ID 到联动主题的映射。
@@ -217,8 +218,11 @@ class LinkageTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        from PyQt5.QtCore import QEvent, Qt
         from PyQt5.QtWidgets import QApplication
 
+        cls.QEvent = QEvent
+        cls.Qt = Qt
         cls.app = QApplication.instance() or QApplication([])
         cls.camera = scanner.CameraScanner()
         cls.level_frame = scanner._build_test_paper(0.0)
@@ -227,50 +231,102 @@ class LinkageTests(unittest.TestCase):
         cls.tilted_analysis = cls.camera.analyze_frame(cls.tilted_frame, tilt_threshold=8.0)
 
     def setUp(self) -> None:
+        self._temp_dir = tempfile.TemporaryDirectory()
         self.window = showcase_main.StandbyWindow(
             video_path=None,
             windowed=True,
             force_fallback=True,
-            camera_enabled=False,
-            scene_seconds=30.0,
+            camera_enabled=True,
+            scene_seconds=8.0,
+            capture_dir=Path(self._temp_dir.name),
         )
-        self.window._stack.setCurrentWidget(self.window._camera_canvas)
+        self.window._play_shutter_feedback = lambda: None
 
     def tearDown(self) -> None:
         self.window.close()
+        self._temp_dir.cleanup()
 
-    def test_ready_state_triggers_after_stable_frames(self) -> None:
-        self.assertEqual(self.level_analysis.status, scanner.ScanStatus.READY)
+    def _press(self, key) -> None:
+        from PyQt5.QtGui import QKeyEvent
 
-        for _ in range(showcase_main.TRIGGER_STABLE_FRAMES - 1):
-            self.window._on_frame_ready(self.level_frame, self.level_analysis)
-        self.assertEqual(self.window._trigger_count, 0)
+        event = QKeyEvent(self.QEvent.KeyPress, key, self.Qt.NoModifier)
+        self.window.keyPressEvent(event)
 
+    def test_standby_video_or_idle_is_default(self) -> None:
+        self.assertEqual(self.window.state, "standby")
+        self.assertIs(self.window._stack.currentWidget(), self.window._idle_canvas)
+        self.assertFalse(self.window._preview_mode)
+        self.assertAlmostEqual(self.window._scene_seconds, 8.0, delta=0.1)
+
+    def test_space_triggers_capture_and_scene(self) -> None:
         self.window._on_frame_ready(self.level_frame, self.level_analysis)
+        self._press(self.Qt.Key_Space)
+
         self.assertEqual(self.window._trigger_count, 1)
+        self.assertEqual(self.window.state, "interactive")
         self.assertIs(self.window._stack.currentWidget(), self.window._scene_canvas)
+        self.assertTrue(self.window._scene_timer.isActive())
+        self.assertGreater(self.window._scene_timer.remainingTime(), 7000)
+
+        self.assertIsNotNone(self.window.last_capture_path)
+        assert self.window.last_capture_path is not None
+        self.assertTrue(self.window.last_capture_path.is_file())
+        self.assertEqual(self.window.last_capture_path.parent, Path(self._temp_dir.name))
+
         self.assertIsNotNone(self.window._scene_canvas.theme)
         assert self.window._scene_canvas.theme is not None
         self.assertEqual(self.window._scene_canvas.theme.key, "garden")
 
-    def test_tilted_state_never_triggers(self) -> None:
-        self.assertEqual(self.tilted_analysis.status, scanner.ScanStatus.TILTED)
+    def test_enter_triggers_capture(self) -> None:
+        self.window._on_frame_ready(self.level_frame, self.level_analysis)
+        self._press(self.Qt.Key_Return)
 
-        for _ in range(showcase_main.TRIGGER_STABLE_FRAMES * 3):
-            self.window._on_frame_ready(self.tilted_frame, self.tilted_analysis)
-        self.assertEqual(self.window._trigger_count, 0)
-        self.assertIs(self.window._stack.currentWidget(), self.window._camera_canvas)
-
-    def test_tilted_frame_resets_ready_streak(self) -> None:
-        self.window._on_frame_ready(self.level_frame, self.level_analysis)
-        self.window._on_frame_ready(self.level_frame, self.level_analysis)
-        self.window._on_frame_ready(self.tilted_frame, self.tilted_analysis)
-        self.window._on_frame_ready(self.level_frame, self.level_analysis)
-        self.assertEqual(self.window._trigger_count, 0)
-
-        self.window._on_frame_ready(self.level_frame, self.level_analysis)
-        self.window._on_frame_ready(self.level_frame, self.level_analysis)
         self.assertEqual(self.window._trigger_count, 1)
+        self.assertEqual(self.window.state, "interactive")
+
+    def test_tilted_paper_is_rejected_with_center_prompt(self) -> None:
+        self.window._on_frame_ready(self.tilted_frame, self.tilted_analysis)
+        self._press(self.Qt.Key_Space)
+
+        self.assertEqual(self.window._trigger_count, 0)
+        self.assertEqual(self.window.state, "standby")
+        self.assertTrue(self.window._overlay.message_visible)
+        self.assertIn("图纸未摆正", self.window._overlay.message)
+
+    def test_missing_qr_is_rejected(self) -> None:
+        analysis = scanner.FrameAnalysis(
+            status=scanner.ScanStatus.READY,
+            codes=(),
+            pose=self.level_analysis.pose,
+            frame_size=self.level_analysis.frame_size,
+            timestamp=self.level_analysis.timestamp,
+        )
+        self.window._on_frame_ready(self.level_frame, analysis)
+        self._press(self.Qt.Key_Enter)
+
+        self.assertEqual(self.window._trigger_count, 0)
+        self.assertIn("二维码", self.window._overlay.message)
+
+    def test_finish_scene_fades_back_to_standby(self) -> None:
+        self.window._on_frame_ready(self.level_frame, self.level_analysis)
+        self._press(self.Qt.Key_Space)
+        self.assertEqual(self.window.state, "interactive")
+
+        self.window._finish_scene()
+        self.assertEqual(self.window.state, "reset")
+        self.assertFalse(self.window._scene_timer.isActive())
+
+        self.window._complete_reset()
+        self.assertEqual(self.window.state, "standby")
+        self.assertIs(self.window._stack.currentWidget(), self.window._idle_canvas)
+
+    def test_repeated_key_while_interactive_does_not_capture_again(self) -> None:
+        self.window._on_frame_ready(self.level_frame, self.level_analysis)
+        self._press(self.Qt.Key_Space)
+        self._press(self.Qt.Key_Space)
+
+        self.assertEqual(self.window._trigger_count, 1)
+        self.assertEqual(self.window.state, "interactive")
 
     def test_camera_and_scene_canvases_render(self) -> None:
         self.window.resize(1280, 720)
@@ -301,11 +357,23 @@ class EntryPointTests(unittest.TestCase):
         args = showcase_main.parse_args([])
         self.assertFalse(args.no_camera)
         self.assertFalse(args.windowed)
+        self.assertFalse(args.camera_preview)
+
+    def test_camera_preview_flag(self) -> None:
+        args = showcase_main.parse_args(["--camera-preview"])
+        self.assertTrue(args.camera_preview)
 
     def test_no_camera_flag_disables_scanner(self) -> None:
         args = showcase_main.parse_args(["--no-camera", "--windowed"])
         self.assertTrue(args.no_camera)
         self.assertTrue(args.windowed)
+
+    def test_autostart_script_exists(self) -> None:
+        script = PROJECT_DIR / "setup_autostart.bat"
+        self.assertTrue(script.is_file())
+        text = script.read_text(encoding="utf-8", errors="ignore")
+        self.assertIn("Startup", text)
+        self.assertIn("run.bat", text)
 
     def test_start_camera_flag_remains_compatible(self) -> None:
         args = showcase_main.parse_args(["--start-camera"])
